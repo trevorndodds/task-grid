@@ -1,0 +1,87 @@
+# Fully containerized TaskGrid stack.
+#
+# This is the preferred local/dev deployment:
+#   docker compose up --build
+#
+# Open:
+#   http://127.0.0.1:8000/ui
+#
+# The manager is the only service exposed to the host. Workers stay on the
+# internal Docker network; the manager proxies worker logs through each
+# worker's log API URL, e.g. http://risk-worker:9201.
+
+services:
+  manager:
+    build: .
+    command: >
+      uvicorn taskgrid.app:app
+      --host 0.0.0.0
+      --port 8000
+    environment:
+      TASKGRID_DB: /data/taskgrid.db
+      TASKGRID_MANAGER_LOG: /data/manager.log
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./taskgrid-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  risk-worker:
+    build: .
+    depends_on:
+      manager:
+        condition: service_healthy
+    command: >
+      python -m taskgrid.worker
+      --broker http://manager:8000
+      --worker-id risk-node-1
+      --module examples.custom_tasks
+      --service-name risk-worker
+      --service-version ${RISK_SERVICE_VERSION:-dev}
+      --instances ${RISK_INSTANCES:-5}
+      --poll-seconds ${POLL_SECONDS:-1.0}
+      --heartbeat-seconds ${HEARTBEAT_SECONDS:-2.0}
+      --broker-pool-size ${BROKER_POOL_SIZE:-4}
+      --log-root /logs
+      --log-api-host 0.0.0.0
+      --log-api-port 9201
+      --log-public-url http://risk-worker:9201
+      --tag risk
+      --tag python3.12
+    environment:
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./worker-logs/risk-node-1:/logs
+
+  pricing-worker:
+    build: .
+    depends_on:
+      manager:
+        condition: service_healthy
+    command: >
+      python -m taskgrid.worker
+      --broker http://manager:8000
+      --worker-id pricing-node-1
+      --module examples.custom_tasks
+      --service-name pricing-worker
+      --service-version ${PRICING_SERVICE_VERSION:-dev}
+      --instances ${PRICING_INSTANCES:-2}
+      --poll-seconds ${POLL_SECONDS:-1.0}
+      --heartbeat-seconds ${HEARTBEAT_SECONDS:-2.0}
+      --broker-pool-size ${BROKER_POOL_SIZE:-4}
+      --log-root /logs
+      --log-api-host 0.0.0.0
+      --log-api-port 9201
+      --log-public-url http://pricing-worker:9201
+      --tag pricing
+      --tag python3.12
+    environment:
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./worker-logs/pricing-node-1:/logs

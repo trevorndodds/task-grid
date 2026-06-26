@@ -1,0 +1,42 @@
+# Worker-only compose file for the common setup where the TaskGrid manager
+# runs outside this compose project, either directly on the host or in another
+# Docker/VM/server environment.
+#
+# Host-manager example:
+#   uvicorn taskgrid.app:app --host 0.0.0.0 --port 8000
+#   docker compose -f docker-compose.worker.yml up --build
+#
+# Manager-container-on-same-host example:
+#   docker compose -f docker-compose.manager.yml up --build
+#   docker compose -f docker-compose.worker.yml up --build
+#
+# Useful overrides:
+#   MANAGER_URL=http://192.168.1.20:8000 WORKER_ID=node-gpu-1 INSTANCES=8 LOG_API_PORT=9202 LOG_PUBLIC_URL=http://192.168.1.30:9202 docker compose -f docker-compose.worker.yml up --build
+
+services:
+  worker:
+    build: .
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: >
+      python -m taskgrid.worker
+      --broker ${MANAGER_URL:-http://host.docker.internal:8000}
+      --worker-id ${WORKER_ID:-docker-node-1}
+      --module ${TASK_MODULE:-examples.custom_tasks}
+      --service-name ${SERVICE_NAME:-taskgrid-worker}
+      --service-version ${SERVICE_VERSION:-dev}
+      --instances ${INSTANCES:-5}
+      --poll-seconds ${POLL_SECONDS:-1.0}
+      --heartbeat-seconds ${HEARTBEAT_SECONDS:-2.0}
+      --broker-pool-size ${BROKER_POOL_SIZE:-4}
+      --log-root /logs
+      --log-api-host 0.0.0.0
+      --log-api-port ${LOG_API_PORT:-9201}
+      --log-public-url ${LOG_PUBLIC_URL:-http://127.0.0.1:9201}
+      ${WORKER_TAGS:-}
+    environment:
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - "${LOG_API_PORT:-9201}:${LOG_API_PORT:-9201}"
+    volumes:
+      - ./worker-logs/${WORKER_ID:-docker-node-1}:/logs

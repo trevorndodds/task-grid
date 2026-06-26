@@ -1,0 +1,32 @@
+# Manager-only container.
+#
+# Use this when you want the TaskGrid manager/UI in Docker but workers are
+# running elsewhere, such as bare metal, other Docker hosts, or Kubernetes.
+#
+# Start:
+#   docker compose -f docker-compose.manager.yml up --build
+#
+# Workers should connect to:
+#   http://<manager-hostname-or-ip>:8000
+
+services:
+  manager:
+    build: .
+    command: >
+      uvicorn taskgrid.app:app
+      --host 0.0.0.0
+      --port 8000
+    environment:
+      TASKGRID_DB: /data/taskgrid.db
+      TASKGRID_MANAGER_LOG: /data/manager.log
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./taskgrid-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s

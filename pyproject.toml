@@ -1,0 +1,13 @@
+[project]
+name = "taskgrid"
+version = "0.10.1"
+description = "TaskGrid: a lightweight distributed task manager"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.110,<1.0",
+  "uvicorn[standard]>=0.29,<1.0",
+  "requests>=2.31,<3",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
