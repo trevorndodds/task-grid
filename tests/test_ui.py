@@ -402,3 +402,86 @@ def test_web_ui_and_api_pause_resume_controls():
         assert api_resume.status_code == 200
         assert int(api_resume.json()["paused"]) == 0
         assert len(core.lease_tasks("node-a", limit=1)) == 1
+
+
+def test_job_and_session_result_stream_endpoints_emit_sse_events():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/sse-api.db"
+        from taskgrid import core
+        from taskgrid.app import app
+
+        job = core.create_job("sse job", "echo", [{"id": "one"}, {"id": "two"}], max_retries=0, session_name="SSE Session")
+        first, second = core.lease_tasks("sse-node", limit=2)
+        core.complete_task(second["id"], "sse-node", {"ok": "two"})
+        core.fail_task(first["id"], "sse-node", "bad one")
+
+        client = TestClient(app)
+        job_stream = client.get(f"/jobs/{job['id']}/results/stream?poll_seconds=0.1&timeout_seconds=5")
+        assert job_stream.status_code == 200
+        assert job_stream.headers["content-type"].startswith("text/event-stream")
+        assert "event: progress" in job_stream.text
+        assert "event: result" in job_stream.text
+        assert "event: done" in job_stream.text
+        assert '"input_key":"one"' in job_stream.text
+        assert '"input_key":"two"' in job_stream.text
+
+        session_stream = client.get(f"/sessions/{job['session_id']}/results/stream?poll_seconds=0.1&timeout_seconds=5")
+        assert session_stream.status_code == 200
+        assert "event: done" in session_stream.text
+        assert '"scope":"session"' in session_stream.text
+
+
+def test_maintenance_reconcile_api_and_ui():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/reconcile-api.db"
+        from taskgrid import core
+        from taskgrid.app import app
+
+        job = core.create_job("reconcile api", "echo", [{"n": 1}, {"n": 2}])
+        task = core.lease_tasks("node-api", limit=1)[0]
+        core.complete_task(task["id"], "node-api", {"ok": True})
+        with core.connection() as conn:
+            conn.execute(
+                "UPDATE jobs SET completed_tasks=0, status='queued' WHERE id=?",
+                (job["id"],),
+            )
+            conn.execute(
+                "UPDATE service_sessions SET completed_tasks=0, status='queued' WHERE id=?",
+                (job["session_id"],),
+            )
+
+        client = TestClient(app)
+        api = client.post("/maintenance/reconcile?recover_expired=false")
+        assert api.status_code == 200
+        payload = api.json()
+        assert payload["jobs_reconciled"] >= 1
+        assert payload["sessions_reconciled"] >= 1
+        assert payload["lease_recovery"]["skipped"] is True
+        assert core.get_job(job["id"])["completed_tasks"] == 1
+
+        page = client.get("/ui/manager/recovery")
+        assert page.status_code == 200
+        assert "Reconcile Manager State" in page.text
+        response = client.post("/ui/manager/recovery/reconcile", follow_redirects=False)
+        assert response.status_code == 303
+
+
+def test_manager_startup_reconcile_repairs_counter_drift():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/startup-reconcile.db"
+        from taskgrid import core
+        from taskgrid.app import app
+
+        job = core.create_job("startup reconcile", "echo", [{"n": 1}])
+        task = core.lease_tasks("node-start", limit=1)[0]
+        core.complete_task(task["id"], "node-start", {"ok": True})
+        with core.connection() as conn:
+            conn.execute("UPDATE jobs SET status='queued', completed_tasks=0, finished_at=NULL WHERE id=?", (job["id"],))
+            conn.execute("UPDATE service_sessions SET status='queued', completed_tasks=0, finished_at=NULL WHERE id=?", (job["session_id"],))
+
+        with TestClient(app) as client:
+            response = client.get(f"/jobs/{job['id']}")
+            assert response.status_code == 200
+            assert response.json()["status"] == "succeeded"
+            assert response.json()["completed_tasks"] == 1
+        assert core.list_events(code="MaintenanceReconcileRun", limit=1)

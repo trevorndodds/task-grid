@@ -701,6 +701,8 @@ job = client.submit(
     name="square numbers",
     task_type="square",
     tasks=[{"x": i} for i in range(100)],
+    input_keys=[f"row-{i}" for i in range(100)],
+    idempotency_key=client.new_idempotency_key("square"),
     session_name="Square Run",
     session_priority=10,
     max_retries=2,
@@ -708,6 +710,12 @@ job = client.submit(
 client.wait(job["id"])
 print(client.results(job["id"]))
 ```
+
+Each submitted payload is stored with a durable `input_index` and optional `input_key`. Pass `input_keys` when the client already has stable row IDs; otherwise TaskGrid derives a key from payload `id`, `input_key`, or `key` when present. Result APIs and CSV/JSON exports default to `order=input`, so clients can map results back to their original input list even when workers complete tasks out of order.
+
+For crash-safe submit retries, pass a stable `client_id` and `idempotency_key`. If the manager commits a job but the client loses the response, retrying with the same key returns the original durable job instead of creating a duplicate. The SDK helper `client.new_idempotency_key(...)` creates a suitable key.
+
+Client reconnect uses `client.reconnect_session(session_id)` with the stored `client_id` and `resume_token`. Session scheduling control uses `client.pause_session(...)` and `client.resume_session(...)`, so reconnect and unpause are no longer overloaded in the SDK.
 
 ## Submit via curl
 
@@ -718,6 +726,8 @@ curl -X POST http://127.0.0.1:8000/jobs \
     "name": "add demo",
     "task_type": "add",
     "tasks": [{"a":1,"b":2},{"a":10,"b":20}],
+    "client_id": "client-alpha",
+    "idempotency_key": "add-demo-001",
     "session_priority": 1,
     "max_retries": 2
   }'
@@ -737,10 +747,12 @@ GET  /clients/{client_id}/sessions/{session_id}
 POST /sessions/{session_id}/priority
 GET  /sessions/{session_id}/jobs
 GET  /sessions/{session_id}/results
+GET  /sessions/{session_id}/results/stream
 GET  /jobs
 GET  /jobs/{job_id}
 GET  /jobs/{job_id}/tasks
 GET  /jobs/{job_id}/results
+GET  /jobs/{job_id}/results/stream
 POST /jobs/{job_id}/cancel
 POST /jobs/{job_id}/retry-failed
 GET  /workers
@@ -796,9 +808,12 @@ Programmatic endpoints are also available:
 
 ```text
 GET  /maintenance/status
+POST /maintenance/reconcile
 POST /maintenance/recover
 POST /workers/purge-offline
 ```
+
+`POST /maintenance/reconcile` is the normal operator-safe repair action. It recomputes job and service-session counters/statuses from durable task rows and, by default, recovers expired leases. The manager also runs this safe reconcile pass on startup so a restart repairs stale derived state without touching valid running leases.
 
 Late or duplicate results from an old worker are ignored and recorded with manager events such as `TaskResultIgnored` or `TaskFailureIgnored`.
 
@@ -930,6 +945,47 @@ python scripts/benchmark_manager_connections.py \
 See `docs/SCALE.md` for current benchmark results and bottleneck notes.
 
 
+
+## Streaming results
+
+For async clients that want completed task results as soon as they are available, TaskGrid exposes Server-Sent Events streams:
+
+```text
+GET /jobs/{job_id}/results/stream
+GET /sessions/{session_id}/results/stream
+```
+
+Streams emit JSON payloads with these event names:
+
+```text
+progress  current job/session counters and status
+result    one newly terminal task result
+done      job/session reached a terminal state and all terminal results were sent
+timeout   optional timeout_seconds was reached before terminal completion
+```
+
+Useful query parameters:
+
+```text
+poll_seconds=0.5      manager polling cadence, 0.1 to 10 seconds
+timeout_seconds=0     0 means no stream timeout
+replay=true           send already-completed terminal results first
+limit=200             max result events fetched per manager poll
+```
+
+The stream cursor uses `(updated_at, task_id)`, so tasks that finish in the same millisecond are streamed once without relying on manager logs. Normal result APIs and exports remain the durable source of truth for reconnect/replay.
+
+Python SDK example:
+
+```python
+for event in client.stream_results(job["id"], timeout_seconds=60):
+    if event["_event"] == "result":
+        task = event["task"]
+        print(task["input_index"], task["input_key"], task["status"], task.get("result"))
+    elif event["_event"] == "done":
+        break
+```
+
 ## Result exports
 
 TaskGrid keeps task rows as the source of truth and lets clients download completed output later, even after disconnecting.
@@ -937,15 +993,15 @@ TaskGrid keeps task rows as the source of truth and lets clients download comple
 Useful endpoints:
 
 ```text
-GET /jobs/{job_id}/results/export?format=json
-GET /jobs/{job_id}/results/export?format=csv
+GET /jobs/{job_id}/results/export?format=json&order=input
+GET /jobs/{job_id}/results/export?format=csv&order=input
 GET /jobs/{job_id}/results/export?format=csv&failed_only=true
-GET /sessions/{session_id}/results/export?format=json
-GET /sessions/{session_id}/results/export?format=csv
+GET /sessions/{session_id}/results/export?format=json&order=input
+GET /sessions/{session_id}/results/export?format=csv&order=input
 GET /sessions/{session_id}/results/export?format=csv&failed_only=true
 ```
 
-The web UI exposes these from job/session result pages as **Download JSON**, **Download CSV**, and **Failed CSV**.
+The web UI exposes these from job/session result pages as **Download JSON**, **Download CSV**, and **Failed CSV**. CSV rows start with `input_index,input_key,...` for stable input-to-result mapping.
 
 ## Retention and cleanup
 

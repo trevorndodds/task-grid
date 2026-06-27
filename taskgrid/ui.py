@@ -239,11 +239,13 @@ def session_table(sessions: list[dict[str, Any]]) -> str:
 
 def task_table(tasks: list[dict[str, Any]]) -> str:
     if not tasks:
-        rows = empty_row(8, "No tasks found.")
+        rows = empty_row(10, "No tasks found.")
     else:
         rows = "".join(
             f"""
             <tr>
+              <td>{h(t.get('input_index') if t.get('input_index') is not None else '—')}</td>
+              <td><code>{h(t.get('input_key') or '—')}</code></td>
               <td><a href='/ui/tasks/{path_id(t['id'])}'><code>{short_id(t['id'])}</code></a></td>
               <td>{status_pill(t['status'])}</td>
               <td>{h(t['task_type'])}</td>
@@ -258,7 +260,7 @@ def task_table(tasks: list[dict[str, Any]]) -> str:
         )
     return f"""
     <table>
-      <thead><tr><th>ID</th><th>Status</th><th>Type</th><th>Attempts</th><th>Worker</th><th>Updated</th><th>Error</th><th></th></tr></thead>
+      <thead><tr><th>Index</th><th>Key</th><th>ID</th><th>Status</th><th>Type</th><th>Attempts</th><th>Worker</th><th>Updated</th><th>Error</th><th></th></tr></thead>
       <tbody>{rows}</tbody>
     </table>
     """
@@ -293,13 +295,15 @@ def event_table(events: list[dict[str, Any]]) -> str:
 
 def result_table(items: list[dict[str, Any]], *, include_job: bool = False) -> str:
     if not items:
-        cols = 9 if include_job else 8
+        cols = 11 if include_job else 10
         rows = empty_row(cols, "No task results yet.")
     else:
         rows = "".join(
             f"""
             <tr>
               {f"<td><a href='/ui/jobs/{path_id(item.get('job_id'))}'><code>{short_id(item.get('job_id'))}</code></a></td>" if include_job else ""}
+              <td>{h(item.get('input_index') if item.get('input_index') is not None else '—')}</td>
+              <td><code>{h(item.get('input_key') or '—')}</code></td>
               <td><a href='/ui/tasks/{path_id(item.get('task_id'))}'><code>{short_id(item.get('task_id'))}</code></a></td>
               <td>{status_pill(item.get('status'))}</td>
               <td><code>{h(item.get('assigned_worker_id') or '—')}</code></td>
@@ -315,7 +319,7 @@ def result_table(items: list[dict[str, Any]], *, include_job: bool = False) -> s
     job_head = "<th>Job</th>" if include_job else ""
     return f"""
     <table>
-      <thead><tr>{job_head}<th>Task</th><th>Status</th><th>Worker</th><th>Attempts</th><th>Start / End</th><th>Payload</th><th>Result</th><th>Value / Error</th></tr></thead>
+      <thead><tr>{job_head}<th>Index</th><th>Key</th><th>Task</th><th>Status</th><th>Worker</th><th>Attempts</th><th>Start / End</th><th>Payload</th><th>Result</th><th>Value / Error</th></tr></thead>
       <tbody>{rows}</tbody>
     </table>
     """
@@ -693,6 +697,7 @@ def task_detail(task_id: str) -> str:
     </div>
     <div class='grid stats'>
       <div class='card stat'><div class='label'>Status</div><div class='value' style='font-size:20px'>{status_pill(task['status'])}</div></div>
+      <div class='card stat'><div class='label'>Input</div><div class='value' style='font-size:16px'>#{h(task.get('input_index') if task.get('input_index') is not None else '—')}<div class='tiny'>{h(task.get('input_key') or '—')}</div></div></div>
       <div class='card stat'><div class='label'>Attempts</div><div class='value'>{h(task['attempts'])}/{1 + int(task['max_retries'])}</div></div>
       <div class='card stat'><div class='label'>Worker</div><div class='value' style='font-size:16px'>{h(task['assigned_worker_id'])}</div></div>
       <div class='card stat'><div class='label'>Updated</div><div class='value' style='font-size:16px'>{h(task['updated_at'])}</div></div>
@@ -1038,9 +1043,14 @@ def manager_recovery_page() -> str:
       <div class='card stat'><div class='label'>Historical Recoveries</div><div class='value'>{h(status.get('lease_requeue_events', 0))}</div><div class='tiny'>failed by lease {h(status.get('lease_failed_events', 0))}</div></div>
     </div>
     <section class='card' style='margin-top:16px'>
-      <h2>Recover Expired Leases</h2>
+      <h2>Reconcile Manager State</h2>
+      <p class='muted'>Recomputes job/session counters and statuses from task rows, and recovers expired leases in the same safe pass. This is also run on manager startup.</p>
+      <form method='post' action='/ui/manager/recovery/reconcile'><button type='submit'>Reconcile Manager State</button></form>
+    </section>
+    <section class='card' style='margin-top:16px'>
+      <h2>Recover Expired Leases Only</h2>
       <p class='muted'>This requeues expired running tasks that still have retry attempts left, or fails them when retries are exhausted. Running tasks with valid leases are not touched.</p>
-      <form method='post' action='/ui/manager/recovery/run'><button type='submit'>Recover Expired Leases</button></form>
+      <form method='post' action='/ui/manager/recovery/run'><button class='secondary' type='submit'>Recover Expired Leases</button></form>
     </section>
     <section class='card' style='margin-top:16px'>
       <h2>Purge Offline Workers</h2>
@@ -1053,10 +1063,16 @@ def manager_recovery_page() -> str:
     </div>
     <section class='card' style='margin-top:16px'>
       <h2>Recovery Events</h2>
-      {event_table(core.list_events(code='MaintenanceRecoveryRun', limit=20) + core.list_events(code='TaskLeaseExpiredRequeued', limit=20) + core.list_events(code='TaskLeaseExpiredFailed', limit=20) + core.list_events(code='TaskResultIgnored', limit=20) + core.list_events(code='WorkerPurgeOfflineRun', limit=20) + core.list_events(code='WorkerPurgedOffline', limit=20))}
+      {event_table(core.list_events(code='MaintenanceReconcileRun', limit=20) + core.list_events(code='MaintenanceRecoveryRun', limit=20) + core.list_events(code='TaskLeaseExpiredRequeued', limit=20) + core.list_events(code='TaskLeaseExpiredFailed', limit=20) + core.list_events(code='TaskResultIgnored', limit=20) + core.list_events(code='WorkerPurgeOfflineRun', limit=20) + core.list_events(code='WorkerPurgedOffline', limit=20))}
     </section>
     """
     return layout("Recovery", body, refresh=True)
+
+
+@router.post("/manager/recovery/reconcile")
+def reconcile_from_ui() -> RedirectResponse:
+    core.reconcile_manager_state(recover_expired=True, updated_by="ui")
+    return RedirectResponse(url="/ui/manager/recovery", status_code=303)
 
 
 @router.post("/manager/recovery/run")

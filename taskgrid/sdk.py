@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any
+import uuid
+from typing import Any, Iterator
 from urllib import parse, request
 
 
@@ -16,6 +17,10 @@ class TaskGridClient:
     def attach(self, client_id: str, resume_token: str) -> None:
         self.client_id = client_id
         self.resume_token = resume_token
+
+    def new_idempotency_key(self, prefix: str = "job") -> str:
+        """Return a caller-storable key for safe submit retries after network/manager failure."""
+        return f"{prefix}-{uuid.uuid4().hex}"
 
     def _headers(self, has_payload: bool = False) -> dict[str, str]:
         headers: dict[str, str] = {"Content-Type": "application/json"} if has_payload else {}
@@ -46,6 +51,40 @@ class TaskGridClient:
         with request.urlopen(req, timeout=30) as response:
             return response.read()
 
+
+
+    def _stream_request(self, path: str, timeout_seconds: float | None = None) -> Iterator[dict[str, Any]]:
+        headers = self._headers(False)
+        headers["Accept"] = "text/event-stream"
+        timeout = None if timeout_seconds is None or timeout_seconds <= 0 else float(timeout_seconds) + 10.0
+        req = request.Request(f"{self.base_url}{path}", headers=headers, method="GET")
+        with request.urlopen(req, timeout=timeout) as response:
+            event = "message"
+            data_lines: list[str] = []
+            for raw_line in response:
+                line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+                if not line:
+                    if data_lines:
+                        payload = "\n".join(data_lines)
+                        try:
+                            out = json.loads(payload)
+                        except json.JSONDecodeError:
+                            out = {"data": payload}
+                        out["_event"] = event
+                        yield out
+                    event = "message"
+                    data_lines = []
+                    continue
+                if line.startswith(":"):
+                    continue
+                if line.startswith("event:"):
+                    event = line[6:].strip() or "message"
+                elif line.startswith("data:"):
+                    value = line[5:]
+                    if value.startswith(" "):
+                        value = value[1:]
+                    data_lines.append(value)
+
     def submit(
         self,
         name: str,
@@ -61,6 +100,8 @@ class TaskGridClient:
         require_capable_worker: bool = False,
         client_id: str | None = None,
         resume_token: str | None = None,
+        input_keys: list[str | int] | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         out = self._request(
             "POST",
@@ -79,6 +120,8 @@ class TaskGridClient:
                 "require_capable_worker": require_capable_worker,
                 "client_id": client_id or self.client_id,
                 "resume_token": resume_token or self.resume_token,
+                "input_keys": input_keys,
+                "idempotency_key": idempotency_key,
             },
         )
         self.client_id = out.get("client_id") or self.client_id
@@ -99,10 +142,19 @@ class TaskGridClient:
             params.append(("status", status))
         return self._request("GET", f"/clients/{parse.quote(self.client_id, safe='')}/sessions?{parse.urlencode(params)}")
 
-    def resume_session(self, session_id: str) -> dict[str, Any]:
+    def reconnect_session(self, session_id: str) -> dict[str, Any]:
+        """Return an owned session using the client's reconnect credentials.
+
+        This is intentionally separate from ``resume_session(...)``, which
+        unpauses a paused service session.
+        """
         if not self.client_id or not self.resume_token:
-            raise ValueError("client_id and resume_token are required to resume a session")
+            raise ValueError("client_id and resume_token are required to reconnect to a session")
         return self._request("GET", f"/clients/{parse.quote(self.client_id, safe='')}/sessions/{parse.quote(session_id, safe='')}?resume_token={parse.quote(self.resume_token, safe='')}")
+
+    def resume_owned_session(self, session_id: str) -> dict[str, Any]:
+        """Backwards-readable alias for reconnecting to an owned session."""
+        return self.reconnect_session(session_id)
 
     def get_session(self, session_id: str) -> dict[str, Any]:
         return self._request("GET", f"/sessions/{session_id}")
@@ -122,8 +174,23 @@ class TaskGridClient:
     def session_jobs(self, session_id: str) -> list[dict[str, Any]]:
         return self._request("GET", f"/sessions/{session_id}/jobs")
 
-    def session_results(self, session_id: str) -> dict[str, Any]:
-        return self._request("GET", f"/sessions/{session_id}/results")
+    def session_results(self, session_id: str, order: str = "input") -> dict[str, Any]:
+        return self._request("GET", f"/sessions/{session_id}/results?{parse.urlencode({'order': order})}")
+
+
+    def stream_session_results(
+        self,
+        session_id: str,
+        poll_seconds: float = 0.5,
+        timeout_seconds: float | None = None,
+        replay: bool = True,
+    ) -> Iterator[dict[str, Any]]:
+        params = {
+            "poll_seconds": str(float(poll_seconds)),
+            "timeout_seconds": str(float(timeout_seconds or 0)),
+            "replay": str(bool(replay)).lower(),
+        }
+        yield from self._stream_request(f"/sessions/{parse.quote(session_id, safe='')}/results/stream?{parse.urlencode(params)}", timeout_seconds=timeout_seconds)
 
     def export_session_results(self, session_id: str, format: str = "json", order: str = "input", failed_only: bool = False) -> bytes:
         params = parse.urlencode({"format": format, "order": order, "failed_only": str(bool(failed_only)).lower()})
@@ -132,8 +199,23 @@ class TaskGridClient:
     def tasks(self, job_id: str) -> list[dict[str, Any]]:
         return self._request("GET", f"/jobs/{job_id}/tasks")
 
-    def results(self, job_id: str) -> dict[str, Any]:
-        return self._request("GET", f"/jobs/{job_id}/results")
+    def results(self, job_id: str, order: str = "input") -> dict[str, Any]:
+        return self._request("GET", f"/jobs/{job_id}/results?{parse.urlencode({'order': order})}")
+
+
+    def stream_results(
+        self,
+        job_id: str,
+        poll_seconds: float = 0.5,
+        timeout_seconds: float | None = None,
+        replay: bool = True,
+    ) -> Iterator[dict[str, Any]]:
+        params = {
+            "poll_seconds": str(float(poll_seconds)),
+            "timeout_seconds": str(float(timeout_seconds or 0)),
+            "replay": str(bool(replay)).lower(),
+        }
+        yield from self._stream_request(f"/jobs/{parse.quote(job_id, safe='')}/results/stream?{parse.urlencode(params)}", timeout_seconds=timeout_seconds)
 
     def export_results(self, job_id: str, format: str = "json", order: str = "input", failed_only: bool = False) -> bytes:
         params = parse.urlencode({"format": format, "order": order, "failed_only": str(bool(failed_only)).lower()})
@@ -204,6 +286,10 @@ class TaskGridClient:
 
     def recover_expired_leases(self) -> dict[str, Any]:
         return self._request("POST", "/maintenance/recover", {})
+
+    def reconcile_manager(self, recover_expired: bool = True) -> dict[str, Any]:
+        suffix = "true" if recover_expired else "false"
+        return self._request("POST", f"/maintenance/reconcile?recover_expired={suffix}", {})
 
     def worker_logs(self, worker_id: str) -> dict[str, Any]:
         return self._request("GET", f"/workers/{worker_id}/logs")

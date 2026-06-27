@@ -78,6 +78,27 @@ def _coerce_priority(value: Any, default: int = 0) -> int:
         return default
 
 
+def _coerce_input_key(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text[:500] if text else None
+
+
+def _input_key_for_payload(payload: dict[str, Any], index: int, input_keys: list[Any] | None = None) -> str | None:
+    if input_keys is not None and index < len(input_keys):
+        explicit = _coerce_input_key(input_keys[index])
+        if explicit is not None:
+            return explicit
+    if isinstance(payload, dict):
+        for key in ("id", "input_key", "key"):
+            if key in payload:
+                derived = _coerce_input_key(payload.get(key))
+                if derived is not None:
+                    return derived
+    return None
+
+
 
 def _safe_log_part(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in str(value or ""))[:180]
@@ -131,6 +152,28 @@ def _normalize_client_id(value: str | None) -> str | None:
     if not text:
         return None
     return "".join(ch if ch.isalnum() or ch in "._:@-" else "_" for ch in text)[:160]
+
+
+def _normalize_idempotency_key(value: str | None) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    return text[:200]
+
+
+def _job_response_with_resume(conn, job_id: str) -> dict[str, Any] | None:
+    job = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    if not job:
+        return None
+    out = row_to_dict(job)
+    session_id = out.get("session_id")
+    if session_id:
+        session = conn.execute("SELECT * FROM service_sessions WHERE id=?", (session_id,)).fetchone()
+        if session:
+            session_data = row_to_dict(session)
+            out["client_id"] = session_data.get("client_id")
+            out["resume_token"] = session_data.get("resume_token")
+    return out
 
 
 def _verify_resume_token(stored: str | None, supplied: str | None) -> bool:
@@ -365,9 +408,10 @@ def recalc_job(conn, job_id: str) -> None:
             """,
             (job_id,),
         ).fetchone()
+        total = conn.execute("SELECT COUNT(*) AS count FROM tasks WHERE job_id=?", (job_id,)).fetchone()["count"]
         conn.execute(
-            "UPDATE jobs SET completed_tasks=?, failed_tasks=?, cancelled_tasks=? WHERE id=?",
-            (counts["completed"] or 0, counts["failed"] or 0, counts["cancelled"] or 0, job_id),
+            "UPDATE jobs SET total_tasks=?, completed_tasks=?, failed_tasks=?, cancelled_tasks=? WHERE id=?",
+            (int(total or 0), counts["completed"] or 0, counts["failed"] or 0, counts["cancelled"] or 0, job_id),
         )
         recalc_session(conn, job["session_id"] if "session_id" in job.keys() else None)
         return
@@ -395,8 +439,8 @@ def recalc_job(conn, job_id: str) -> None:
 
     current_status = job["status"]
     next_status = current_status
-    patch: list[Any] = [completed, failed, cancelled]
-    set_parts = ["completed_tasks=?", "failed_tasks=?", "cancelled_tasks=?"]
+    patch: list[Any] = [int(total or 0), completed, failed, cancelled]
+    set_parts = ["total_tasks=?", "completed_tasks=?", "failed_tasks=?", "cancelled_tasks=?"]
 
     if current_status == CANCELLING_JOB_STATUS and running > 0:
         next_status = CANCELLING_JOB_STATUS
@@ -423,6 +467,8 @@ def recalc_job(conn, job_id: str) -> None:
             set_parts.append("finished_at=?")
             patch.append(now())
         log_event(conn, "info", "job", job_id, f"job status changed to {next_status}", {"status": next_status}, code="JobStatusChanged")
+    if next_status not in TERMINAL_JOB_STATUSES and job["finished_at"] is not None:
+        set_parts.append("finished_at=NULL")
 
     patch.append(job_id)
     conn.execute(f"UPDATE jobs SET {', '.join(set_parts)} WHERE id=?", patch)
@@ -536,14 +582,41 @@ def create_job(
     require_capable_worker: bool = False,
     client_id: str | None = None,
     resume_token: str | None = None,
+    input_keys: list[Any] | None = None,
+    idempotency_key: str | None = None,
 ) -> dict[str, Any]:
     init_db()
+    if input_keys is not None and len(input_keys) != len(payloads):
+        raise ValueError("input_keys length must match payloads length")
     job_id = new_id("job")
     created = now()
     session_created = False
     normalized_client_id = _normalize_client_id(client_id) or new_id("client")
+    normalized_idempotency_key = _normalize_idempotency_key(idempotency_key)
     with connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        if normalized_idempotency_key:
+            existing_job = conn.execute(
+                """
+                SELECT id FROM jobs
+                WHERE client_id=? AND idempotency_key=?
+                LIMIT 1
+                """,
+                (normalized_client_id, normalized_idempotency_key),
+            ).fetchone()
+            if existing_job:
+                out = _job_response_with_resume(conn, existing_job["id"])
+                log_event(
+                    conn,
+                    "info",
+                    "job",
+                    existing_job["id"],
+                    "idempotent job submission replayed",
+                    {"client_id": normalized_client_id, "idempotency_key": normalized_idempotency_key},
+                    code="JobSubmissionReplayed",
+                )
+                conn.execute("COMMIT")
+                return out or {"id": existing_job["id"]}
         capability = _capability_for_submit(conn, task_type, metadata or {})
         if require_capable_worker and capability.get("warnings"):
             conn.execute("ROLLBACK")
@@ -619,21 +692,33 @@ def create_job(
         effective_job_priority = requested_job_priority if supplied_job_priority else effective_session_priority
         conn.execute(
             """
-            INSERT INTO jobs(id, session_id, name, task_type, status, priority, total_tasks, created_at, metadata_json)
-            VALUES(?,?,?,?,?,?,?,?,?)
+            INSERT INTO jobs(id, session_id, name, task_type, status, priority, total_tasks, client_id, idempotency_key, created_at, metadata_json)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)
             """,
-            (job_id, session_id, name, task_type, "queued", effective_job_priority, len(payloads), created, dumps(metadata or {})),
+            (job_id, session_id, name, task_type, "queued", effective_job_priority, len(payloads), normalized_client_id, normalized_idempotency_key, created, dumps(metadata or {})),
         )
         task_rows = [
-            (new_id("task"), job_id, task_type, dumps(payload), "queued", effective_job_priority, max_retries, created, created)
-            for payload in payloads
+            (
+                new_id("task"),
+                job_id,
+                task_type,
+                dumps(payload),
+                index,
+                _input_key_for_payload(payload, index, input_keys),
+                "queued",
+                effective_job_priority,
+                max_retries,
+                created,
+                created,
+            )
+            for index, payload in enumerate(payloads)
         ]
         conn.executemany(
             """
             INSERT INTO tasks(
-                id, job_id, task_type, payload_json, status, priority,
+                id, job_id, task_type, payload_json, input_index, input_key, status, priority,
                 max_retries, created_at, updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?)
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
             """,
             task_rows,
         )
@@ -647,6 +732,7 @@ def create_job(
             "capable_workers": [worker.get("id") for worker in capability.get("capable_workers", [])],
             "capability_warnings": capability.get("warnings", []),
             "client_id": normalized_client_id,
+            "idempotency_key": normalized_idempotency_key,
         }
         log_event(conn, "info", "job", job_id, "job submitted", capability_event, code="JobSubmitted")
         if capability.get("warnings"):
@@ -1199,6 +1285,116 @@ def recovery_status(active_seconds: int | None = None) -> dict[str, Any]:
     }
 
 
+
+_RECONCILE_JOB_FIELDS = (
+    "status",
+    "total_tasks",
+    "completed_tasks",
+    "failed_tasks",
+    "cancelled_tasks",
+    "started_at",
+    "finished_at",
+)
+
+_RECONCILE_SESSION_FIELDS = (
+    "status",
+    "total_jobs",
+    "total_tasks",
+    "queued_tasks",
+    "running_tasks",
+    "completed_tasks",
+    "failed_tasks",
+    "cancelled_tasks",
+    "started_at",
+    "finished_at",
+)
+
+
+def _snapshot_rows(conn: Any, table: str, fields: tuple[str, ...]) -> dict[str, dict[str, Any]]:
+    columns = ", ".join(("id", *fields))
+    return {
+        row["id"]: {field: row[field] for field in fields}
+        for row in conn.execute(f"SELECT {columns} FROM {table}").fetchall()
+    }
+
+
+def _changed_rows(before: dict[str, dict[str, Any]], after: dict[str, dict[str, Any]], *, limit: int = 200) -> tuple[int, list[dict[str, Any]]]:
+    changed: list[dict[str, Any]] = []
+    count = 0
+    for row_id in sorted(set(before) | set(after)):
+        old = before.get(row_id)
+        new = after.get(row_id)
+        if old == new:
+            continue
+        count += 1
+        if len(changed) >= limit:
+            continue
+        changed.append({"id": row_id, "before": old, "after": new})
+    return count, changed
+
+
+def reconcile_manager_state(recover_expired: bool = True, updated_by: str = "api") -> dict[str, Any]:
+    """Repair manager-derived state after crashes, restarts, or manual DB edits.
+
+    Task rows are the durable source of truth. This pass optionally recovers
+    expired running leases, then recalculates job and service-session counters
+    and terminal statuses from the task table. Valid running leases are left
+    untouched, so the call is safe on manager startup.
+    """
+    init_db()
+    timestamp = now()
+    with connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        jobs_before = _snapshot_rows(conn, "jobs", _RECONCILE_JOB_FIELDS)
+        sessions_before = _snapshot_rows(conn, "service_sessions", _RECONCILE_SESSION_FIELDS)
+        lease_recovery = expire_stale_tasks(conn) if recover_expired else {
+            "checked_at": timestamp,
+            "expired": 0,
+            "requeued": 0,
+            "failed": 0,
+            "tasks": [],
+            "skipped": True,
+        }
+        job_ids = [row["id"] for row in conn.execute("SELECT id FROM jobs ORDER BY created_at ASC, id ASC").fetchall()]
+        for job_id in job_ids:
+            recalc_job(conn, job_id)
+        session_ids = [row["id"] for row in conn.execute("SELECT id FROM service_sessions ORDER BY created_at ASC, id ASC").fetchall()]
+        for session_id in session_ids:
+            recalc_session(conn, session_id)
+        jobs_after = _snapshot_rows(conn, "jobs", _RECONCILE_JOB_FIELDS)
+        sessions_after = _snapshot_rows(conn, "service_sessions", _RECONCILE_SESSION_FIELDS)
+        job_change_count, changed_jobs = _changed_rows(jobs_before, jobs_after)
+        session_change_count, changed_sessions = _changed_rows(sessions_before, sessions_after)
+        summary = {
+            "checked_at": timestamp,
+            "recover_expired": bool(recover_expired),
+            "updated_by": updated_by,
+            "jobs_checked": len(job_ids),
+            "sessions_checked": len(session_ids),
+            "jobs_reconciled": job_change_count,
+            "sessions_reconciled": session_change_count,
+            "changed_jobs": changed_jobs,
+            "changed_sessions": changed_sessions,
+            "lease_recovery": lease_recovery,
+        }
+        log_event(
+            conn,
+            "info",
+            "manager",
+            "maintenance",
+            f"manager reconcile run; jobs {job_change_count} sessions {session_change_count} expired {lease_recovery.get('expired', 0)}",
+            {
+                **summary,
+                "changed_jobs": changed_jobs[:25],
+                "changed_sessions": changed_sessions[:25],
+            },
+            code="MaintenanceReconcileRun",
+        )
+        conn.execute("COMMIT")
+    summary["status"] = recovery_status()
+    return summary
+
+
 def recover_expired_leases(updated_by: str = "api") -> dict[str, Any]:
     """Manager maintenance action to immediately process expired task leases."""
     init_db()
@@ -1272,7 +1468,7 @@ def lease_tasks(worker_id: str, limit: int = 1, lease_seconds: int = 60, instanc
               AND j.status NOT IN ('cancelled','cancelling')
               AND COALESCE(j.paused, 0) = 0
               AND (s.id IS NULL OR COALESCE(s.paused, 0) = 0)
-            ORDER BY t.priority DESC, t.created_at ASC
+            ORDER BY t.priority DESC, t.created_at ASC, COALESCE(t.input_index, 9223372036854775807) ASC, t.id ASC
             LIMIT ?
             """,
             (max(limit * LEASE_CANDIDATE_MULTIPLIER, limit),),
@@ -1366,7 +1562,7 @@ def lease_tasks_for_instances(worker_id: str, instance_ids: list[str], lease_sec
               AND j.status NOT IN ('cancelled','cancelling')
               AND COALESCE(j.paused, 0) = 0
               AND (s.id IS NULL OR COALESCE(s.paused, 0) = 0)
-            ORDER BY t.priority DESC, t.created_at ASC
+            ORDER BY t.priority DESC, t.created_at ASC, COALESCE(t.input_index, 9223372036854775807) ASC, t.id ASC
             LIMIT ?
             """,
             (max(len(cleaned) * LEASE_CANDIDATE_MULTIPLIER, len(cleaned)),),
@@ -1952,6 +2148,8 @@ def _task_result_row(task: dict[str, Any]) -> dict[str, Any]:
         "task_id": task["id"],
         "job_id": task["job_id"],
         "task_type": task["task_type"],
+        "input_index": task.get("input_index"),
+        "input_key": task.get("input_key"),
         "status": task["status"],
         "attempts": task["attempts"],
         "max_retries": task["max_retries"],
@@ -1968,15 +2166,18 @@ def _task_result_row(task: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def get_job_results(job_id: str) -> dict[str, Any] | None:
+def get_job_results(job_id: str, *, order: str = "input") -> dict[str, Any] | None:
     init_db()
     with connection() as conn:
         job_row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         if not job_row:
             return None
         job = row_to_dict(job_row)
-        task_rows = conn.execute("SELECT * FROM tasks WHERE job_id=? ORDER BY created_at ASC", (job_id,)).fetchall()
-        tasks = [_task_result_row(row_to_dict(row)) for row in task_rows]
+        task_rows = conn.execute(
+            "SELECT * FROM tasks WHERE job_id=? ORDER BY COALESCE(input_index, 9223372036854775807) ASC, created_at ASC, id ASC",
+            (job_id,),
+        ).fetchall()
+        tasks = _ordered_result_tasks([_task_result_row(row_to_dict(row)) for row in task_rows], order=order)
         return {
             "job_id": job["id"],
             "session_id": job.get("session_id"),
@@ -1995,13 +2196,13 @@ def get_job_results(job_id: str) -> dict[str, Any] | None:
             "tasks": tasks,
             # Backwards-compatible compact shape used by early client code.
             "results": [
-                {"task_id": item["task_id"], "status": item["status"], "result": item.get("result"), "error": item.get("error")}
+                {"task_id": item["task_id"], "input_index": item.get("input_index"), "input_key": item.get("input_key"), "status": item["status"], "result": item.get("result"), "error": item.get("error")}
                 for item in tasks
             ],
         }
 
 
-def get_session_results(session_id: str) -> dict[str, Any] | None:
+def get_session_results(session_id: str, *, order: str = "input") -> dict[str, Any] | None:
     init_db()
     with connection() as conn:
         session_row = conn.execute("SELECT * FROM service_sessions WHERE id=?", (session_id,)).fetchone()
@@ -2013,8 +2214,13 @@ def get_session_results(session_id: str) -> dict[str, Any] | None:
         all_tasks: list[dict[str, Any]] = []
         for job_row in job_rows:
             job = row_to_dict(job_row)
-            task_rows = conn.execute("SELECT * FROM tasks WHERE job_id=? ORDER BY created_at ASC", (job["id"],)).fetchall()
-            tasks = [_task_result_row(row_to_dict(row)) for row in task_rows]
+            task_rows = conn.execute(
+                "SELECT * FROM tasks WHERE job_id=? ORDER BY COALESCE(input_index, 9223372036854775807) ASC, created_at ASC, id ASC",
+                (job["id"],),
+            ).fetchall()
+            tasks = _ordered_result_tasks([_task_result_row(row_to_dict(row)) for row in task_rows], order=order)
+            for item in tasks:
+                item["job_created_at"] = job.get("created_at")
             all_tasks.extend(tasks)
             jobs.append(
                 {
@@ -2051,24 +2257,205 @@ def get_session_results(session_id: str) -> dict[str, Any] | None:
             "finished_at": session.get("finished_at"),
             "metadata": session.get("metadata", {}),
             "jobs": jobs,
-            "tasks": all_tasks,
+            "tasks": _ordered_result_tasks(all_tasks, order=order),
             "results": [
-                {"task_id": item["task_id"], "job_id": item["job_id"], "status": item["status"], "result": item.get("result"), "error": item.get("error")}
-                for item in all_tasks
+                {"task_id": item["task_id"], "job_id": item["job_id"], "input_index": item.get("input_index"), "input_key": item.get("input_key"), "status": item["status"], "result": item.get("result"), "error": item.get("error")}
+                for item in _ordered_result_tasks(all_tasks, order=order)
             ],
         }
 
 
 
+
+
+def _result_stream_summary_from_job(job: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "job_id": job.get("id") or job.get("job_id"),
+        "session_id": job.get("session_id"),
+        "name": job.get("name"),
+        "task_type": job.get("task_type"),
+        "status": job.get("status"),
+        "priority": job.get("priority", 0),
+        "total_tasks": int(job.get("total_tasks") or 0),
+        "queued_tasks": int(job.get("total_tasks") or 0) - int(job.get("completed_tasks") or 0) - int(job.get("failed_tasks") or 0) - int(job.get("cancelled_tasks") or 0),
+        "completed_tasks": int(job.get("completed_tasks") or 0),
+        "failed_tasks": int(job.get("failed_tasks") or 0),
+        "cancelled_tasks": int(job.get("cancelled_tasks") or 0),
+        "created_at": job.get("created_at"),
+        "started_at": job.get("started_at"),
+        "finished_at": job.get("finished_at"),
+    }
+
+
+def _result_stream_summary_from_session(session: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "session_id": session.get("id") or session.get("session_id"),
+        "name": session.get("name"),
+        "status": session.get("status"),
+        "priority": session.get("priority", 0),
+        "total_jobs": int(session.get("total_jobs") or 0),
+        "total_tasks": int(session.get("total_tasks") or 0),
+        "queued_tasks": int(session.get("queued_tasks") or 0),
+        "running_tasks": int(session.get("running_tasks") or 0),
+        "completed_tasks": int(session.get("completed_tasks") or 0),
+        "failed_tasks": int(session.get("failed_tasks") or 0),
+        "cancelled_tasks": int(session.get("cancelled_tasks") or 0),
+        "created_at": session.get("created_at"),
+        "started_at": session.get("started_at"),
+        "finished_at": session.get("finished_at"),
+    }
+
+
+def _cursor_clause(alias: str, after_updated_at: str | None, after_task_id: str | None) -> tuple[str, list[Any]]:
+    if not after_updated_at:
+        return "", []
+    return f" AND ({alias}.updated_at > ? OR ({alias}.updated_at = ? AND {alias}.id > ?))", [after_updated_at, after_updated_at, after_task_id or ""]
+
+
+def latest_job_result_cursor(job_id: str) -> dict[str, str | None] | None:
+    """Return the latest terminal task cursor for a job result stream."""
+    init_db()
+    with connection() as conn:
+        row = conn.execute(
+            """
+            SELECT updated_at, id AS task_id
+            FROM tasks
+            WHERE job_id=? AND status IN ('succeeded','failed','cancelled')
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 1
+            """,
+            (job_id,),
+        ).fetchone()
+        if not row:
+            return {"updated_at": None, "task_id": None}
+        return {"updated_at": row["updated_at"], "task_id": row["task_id"]}
+
+
+def latest_session_result_cursor(session_id: str) -> dict[str, str | None] | None:
+    """Return the latest terminal task cursor for a session result stream."""
+    init_db()
+    with connection() as conn:
+        exists = conn.execute("SELECT 1 FROM service_sessions WHERE id=?", (session_id,)).fetchone()
+        if not exists:
+            return None
+        row = conn.execute(
+            """
+            SELECT t.updated_at, t.id AS task_id
+            FROM tasks t
+            JOIN jobs j ON j.id = t.job_id
+            WHERE j.session_id=? AND t.status IN ('succeeded','failed','cancelled')
+            ORDER BY t.updated_at DESC, t.id DESC
+            LIMIT 1
+            """,
+            (session_id,),
+        ).fetchone()
+        if not row:
+            return {"updated_at": None, "task_id": None}
+        return {"updated_at": row["updated_at"], "task_id": row["task_id"]}
+
+
+def get_job_result_updates(
+    job_id: str,
+    *,
+    after_updated_at: str | None = None,
+    after_task_id: str | None = None,
+    limit: int = 200,
+) -> dict[str, Any] | None:
+    """Return newly terminal task results for an SSE/polling cursor.
+
+    The cursor is a stable `(updated_at, task_id)` pair so multiple tasks that
+    finish in the same millisecond are still streamed exactly once.
+    """
+    init_db()
+    limit = max(1, min(1000, int(limit or 200)))
+    with connection() as conn:
+        job_row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if not job_row:
+            return None
+        job = row_to_dict(job_row)
+        clause, params = _cursor_clause("t", after_updated_at, after_task_id)
+        rows = conn.execute(
+            f"""
+            SELECT t.*
+            FROM tasks t
+            WHERE t.job_id=? AND t.status IN ('succeeded','failed','cancelled')
+            {clause}
+            ORDER BY t.updated_at ASC, t.id ASC
+            LIMIT ?
+            """,
+            [job_id, *params, limit],
+        ).fetchall()
+        tasks = [_task_result_row(row_to_dict(row)) for row in rows]
+        next_cursor = {"updated_at": after_updated_at, "task_id": after_task_id}
+        if tasks:
+            last = tasks[-1]
+            next_cursor = {"updated_at": last.get("updated_at"), "task_id": last.get("task_id")}
+        return {
+            "scope": "job",
+            "terminal": job.get("status") in TERMINAL_JOB_STATUSES,
+            "summary": _result_stream_summary_from_job(job),
+            "tasks": tasks,
+            "cursor": next_cursor,
+            "has_more": len(tasks) >= limit,
+        }
+
+
+def get_session_result_updates(
+    session_id: str,
+    *,
+    after_updated_at: str | None = None,
+    after_task_id: str | None = None,
+    limit: int = 200,
+) -> dict[str, Any] | None:
+    """Return newly terminal task results across every job in a service session."""
+    init_db()
+    limit = max(1, min(1000, int(limit or 200)))
+    with connection() as conn:
+        session_row = conn.execute("SELECT * FROM service_sessions WHERE id=?", (session_id,)).fetchone()
+        if not session_row:
+            return None
+        session = row_to_dict(session_row)
+        clause, params = _cursor_clause("t", after_updated_at, after_task_id)
+        rows = conn.execute(
+            f"""
+            SELECT t.*, j.created_at AS job_created_at, j.name AS job_name
+            FROM tasks t
+            JOIN jobs j ON j.id = t.job_id
+            WHERE j.session_id=? AND t.status IN ('succeeded','failed','cancelled')
+            {clause}
+            ORDER BY t.updated_at ASC, t.id ASC
+            LIMIT ?
+            """,
+            [session_id, *params, limit],
+        ).fetchall()
+        tasks: list[dict[str, Any]] = []
+        for row in rows:
+            task = _task_result_row(row_to_dict(row))
+            task["job_created_at"] = row["job_created_at"]
+            task["job_name"] = row["job_name"]
+            tasks.append(task)
+        next_cursor = {"updated_at": after_updated_at, "task_id": after_task_id}
+        if tasks:
+            last = tasks[-1]
+            next_cursor = {"updated_at": last.get("updated_at"), "task_id": last.get("task_id")}
+        return {
+            "scope": "session",
+            "terminal": session.get("status") in TERMINAL_JOB_STATUSES,
+            "summary": _result_stream_summary_from_session(session),
+            "tasks": tasks,
+            "cursor": next_cursor,
+            "has_more": len(tasks) >= limit,
+        }
+
 def _ordered_result_tasks(items: list[dict[str, Any]], order: str = "input") -> list[dict[str, Any]]:
     key = str(order or "input").lower()
     if key in {"completed", "finished", "finished_at"}:
-        return sorted(items, key=lambda item: (item.get("finished_at") or "9999", item.get("created_at") or "", item.get("task_id") or ""))
+        return sorted(items, key=lambda item: (item.get("finished_at") or "9999", item.get("created_at") or "", item.get("input_index") if item.get("input_index") is not None else 9223372036854775807, item.get("task_id") or ""))
     if key in {"started", "started_at"}:
-        return sorted(items, key=lambda item: (item.get("started_at") or "9999", item.get("created_at") or "", item.get("task_id") or ""))
+        return sorted(items, key=lambda item: (item.get("started_at") or "9999", item.get("created_at") or "", item.get("input_index") if item.get("input_index") is not None else 9223372036854775807, item.get("task_id") or ""))
     if key == "status":
-        return sorted(items, key=lambda item: (item.get("status") or "", item.get("created_at") or "", item.get("task_id") or ""))
-    return list(items)
+        return sorted(items, key=lambda item: (item.get("status") or "", item.get("input_index") if item.get("input_index") is not None else 9223372036854775807, item.get("created_at") or "", item.get("task_id") or ""))
+    return sorted(items, key=lambda item: (item.get("job_created_at") or "", item.get("job_id") or "", item.get("input_index") if item.get("input_index") is not None else 9223372036854775807, item.get("created_at") or "", item.get("task_id") or ""))
 
 
 def _results_csv_rows(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2076,6 +2463,8 @@ def _results_csv_rows(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for item in tasks:
         rows.append(
             {
+                "input_index": item.get("input_index"),
+                "input_key": item.get("input_key") or "",
                 "task_id": item.get("task_id"),
                 "job_id": item.get("job_id"),
                 "task_type": item.get("task_type"),
@@ -2096,6 +2485,8 @@ def _results_csv_rows(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def results_to_csv(tasks: list[dict[str, Any]]) -> str:
     fields = [
+        "input_index",
+        "input_key",
         "task_id",
         "job_id",
         "task_type",
@@ -2118,7 +2509,7 @@ def results_to_csv(tasks: list[dict[str, Any]]) -> str:
 
 
 def export_job_results(job_id: str, *, fmt: str = "json", order: str = "input", failed_only: bool = False) -> tuple[str, str, str] | None:
-    data = get_job_results(job_id)
+    data = get_job_results(job_id, order=order)
     if not data:
         return None
     tasks = _ordered_result_tasks(data.get("tasks", []), order=order)
@@ -2127,7 +2518,7 @@ def export_job_results(job_id: str, *, fmt: str = "json", order: str = "input", 
     data = dict(data)
     data["tasks"] = tasks
     data["results"] = [
-        {"task_id": item["task_id"], "status": item["status"], "result": item.get("result"), "error": item.get("error")}
+        {"task_id": item["task_id"], "input_index": item.get("input_index"), "input_key": item.get("input_key"), "status": item["status"], "result": item.get("result"), "error": item.get("error")}
         for item in tasks
     ]
     safe_name = _safe_log_part(data.get("name") or job_id)
@@ -2139,7 +2530,7 @@ def export_job_results(job_id: str, *, fmt: str = "json", order: str = "input", 
 
 
 def export_session_results(session_id: str, *, fmt: str = "json", order: str = "input", failed_only: bool = False) -> tuple[str, str, str] | None:
-    data = get_session_results(session_id)
+    data = get_session_results(session_id, order=order)
     if not data:
         return None
     tasks = _ordered_result_tasks(data.get("tasks", []), order=order)
@@ -2148,7 +2539,7 @@ def export_session_results(session_id: str, *, fmt: str = "json", order: str = "
     data = dict(data)
     data["tasks"] = tasks
     data["results"] = [
-        {"task_id": item["task_id"], "job_id": item.get("job_id"), "status": item["status"], "result": item.get("result"), "error": item.get("error")}
+        {"task_id": item["task_id"], "job_id": item.get("job_id"), "input_index": item.get("input_index"), "input_key": item.get("input_key"), "status": item["status"], "result": item.get("result"), "error": item.get("error")}
         for item in tasks
     ]
     # Keep nested job summaries but do not duplicate every task inside each job for failed-only exports.
@@ -2391,7 +2782,7 @@ def list_tasks(job_id: str | None = None, limit: int = 500) -> list[dict[str, An
     with connection() as conn:
         if job_id:
             rows = conn.execute(
-                "SELECT * FROM tasks WHERE job_id=? ORDER BY created_at ASC LIMIT ?",
+                "SELECT * FROM tasks WHERE job_id=? ORDER BY COALESCE(input_index, 9223372036854775807) ASC, created_at ASC, id ASC LIMIT ?",
                 (job_id, limit),
             ).fetchall()
         else:

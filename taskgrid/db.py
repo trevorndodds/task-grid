@@ -85,6 +85,8 @@ def init_db() -> None:
                 completed_tasks INTEGER NOT NULL DEFAULT 0,
                 failed_tasks INTEGER NOT NULL DEFAULT 0,
                 cancelled_tasks INTEGER NOT NULL DEFAULT 0,
+                client_id TEXT,
+                idempotency_key TEXT,
                 created_at TEXT NOT NULL,
                 started_at TEXT,
                 finished_at TEXT,
@@ -100,6 +102,8 @@ def init_db() -> None:
                 job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
                 task_type TEXT NOT NULL,
                 payload_json TEXT NOT NULL,
+                input_index INTEGER,
+                input_key TEXT,
                 status TEXT NOT NULL,
                 priority INTEGER NOT NULL DEFAULT 0,
                 attempts INTEGER NOT NULL DEFAULT 0,
@@ -117,11 +121,16 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_jobs_session
                 ON jobs(session_id, created_at DESC);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_client_idempotency
+                ON jobs(client_id, idempotency_key)
+                WHERE client_id IS NOT NULL AND idempotency_key IS NOT NULL;
 
             CREATE INDEX IF NOT EXISTS idx_tasks_queue
                 ON tasks(status, priority DESC, created_at ASC);
             CREATE INDEX IF NOT EXISTS idx_tasks_job
                 ON tasks(job_id, status);
+            CREATE INDEX IF NOT EXISTS idx_tasks_input_order
+                ON tasks(job_id, input_index, id);
             CREATE INDEX IF NOT EXISTS idx_tasks_lease
                 ON tasks(status, lease_expires_at);
             CREATE INDEX IF NOT EXISTS idx_tasks_assigned
@@ -182,8 +191,14 @@ def init_db() -> None:
             conn.execute("ALTER TABLE jobs ADD COLUMN paused_at TEXT")
         if "pause_reason" not in job_columns:
             conn.execute("ALTER TABLE jobs ADD COLUMN pause_reason TEXT")
+        if "client_id" not in job_columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN client_id TEXT")
+            conn.execute("UPDATE jobs SET client_id=(SELECT client_id FROM service_sessions WHERE service_sessions.id=jobs.session_id) WHERE client_id IS NULL")
+        if "idempotency_key" not in job_columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN idempotency_key TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_session ON jobs(session_id, created_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_paused ON jobs(paused, status)")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_client_idempotency ON jobs(client_id, idempotency_key) WHERE client_id IS NOT NULL AND idempotency_key IS NOT NULL")
 
         session_columns = {row[1] for row in conn.execute("PRAGMA table_info(service_sessions)").fetchall()}
         if "priority" not in session_columns:
@@ -202,6 +217,29 @@ def init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_service_sessions_client ON service_sessions(client_id, created_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_service_sessions_paused ON service_sessions(paused, status)")
 
+        task_columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+        added_input_index = False
+        if "input_index" not in task_columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN input_index INTEGER")
+            added_input_index = True
+        if "input_key" not in task_columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN input_key TEXT")
+        if added_input_index:
+            # Existing databases predate first-class input indexes. Backfill a
+            # stable per-job order from the old insertion order approximation so
+            # historical exports become deterministic without rewriting task ids.
+            job_ids = [row[0] for row in conn.execute("SELECT id FROM jobs ORDER BY created_at ASC, id ASC").fetchall()]
+            for job_id in job_ids:
+                task_ids = [
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT id FROM tasks WHERE job_id=? ORDER BY created_at ASC, id ASC",
+                        (job_id,),
+                    ).fetchall()
+                ]
+                for index, task_id in enumerate(task_ids):
+                    conn.execute("UPDATE tasks SET input_index=? WHERE id=? AND input_index IS NULL", (index, task_id))
+
         columns = {row[1] for row in conn.execute("PRAGMA table_info(events)").fetchall()}
         if "code" not in columns:
             conn.execute("ALTER TABLE events ADD COLUMN code TEXT NOT NULL DEFAULT ''")
@@ -219,3 +257,4 @@ def init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_assigned ON tasks(status, assigned_worker_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_finished ON tasks(job_id, finished_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_status_updated ON tasks(status, updated_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_input_order ON tasks(job_id, input_index, id)")

@@ -43,6 +43,8 @@ job = client.submit(
     name="square numbers",
     task_type="square",
     tasks=[{"x": i} for i in range(10)],
+    input_keys=[f"row-{i}" for i in range(10)],
+    idempotency_key=client.new_idempotency_key("square"),
     session_name="Square Run",
     session_priority=10,
     max_retries=2,
@@ -56,6 +58,8 @@ Parameters:
 | `name` | `str` | Human-readable job name. |
 | `task_type` | `str` | Registered task type on the worker. |
 | `tasks` | `list[dict]` | One payload dict per task. |
+| `input_keys` | `list[str | int] | None` | Optional stable key per payload. If omitted, keys are derived from payload `id`, `input_key`, or `key` when present. |
+| `idempotency_key` | `str | None` | Optional stable submit key. Reusing the same `client_id` + key returns the existing job after ambiguous failures. |
 | `priority` | `int | None` | Optional job-level priority override. |
 | `session_priority` | `int | None` | Priority for the service session. |
 | `max_retries` | `int` | Automatic retries per task. |
@@ -66,6 +70,20 @@ Parameters:
 | `client_id` | `str | None` | Override the client's owner id for this submission. |
 | `resume_token` | `str | None` | Resume token for securely attaching to an existing owned session. |
 | `require_capable_worker` | `bool` | Reject early when no capable worker is online. |
+
+Safe retry after a lost submit response:
+
+```python
+client = TaskGridClient("http://127.0.0.1:8000", client_id="client-alpha")
+submit_key = client.new_idempotency_key("daily-square")
+
+try:
+    job = client.submit("daily square", "square", [{"x": 1}], idempotency_key=submit_key)
+except OSError:
+    # The manager may have committed before the connection died. Retry with the
+    # same key to recover the existing job instead of creating a duplicate.
+    job = client.submit("daily square", "square", [{"x": 1}], idempotency_key=submit_key)
+```
 
 Return value is the created job object, including `id`, `session_id`, `client_id`, and `resume_token`.
 
@@ -114,16 +132,35 @@ Raises `TimeoutError` if `timeout_seconds` is supplied and exceeded.
 ### Get job results
 
 ```python
-results = client.results(job["id"])
+results = client.results(job["id"], order="input")
 ```
 
 ### Get session results
 
 ```python
-session_results = client.session_results(job["session_id"])
+session_results = client.session_results(job["session_id"], order="input")
 ```
 
-Result entries include payload, result/error, status, worker node, instance ID, executor ID, attempts, and timing.
+Result entries include `input_index`, `input_key`, payload, result/error, status, assigned worker instance, attempts, and timing. `order="input"` is the default and remains deterministic even when tasks finish out of order. `order` can also be `started`, `completed`, or `status`.
+
+
+### Stream results
+
+```python
+for event in client.stream_results(job["id"], timeout_seconds=60):
+    if event["_event"] == "progress":
+        print(event["summary"]["status"], event["summary"].get("completed_tasks"))
+    elif event["_event"] == "result":
+        task = event["task"]
+        print(task["input_index"], task["input_key"], task["status"], task.get("result"))
+    elif event["_event"] in {"done", "timeout"}:
+        break
+
+for event in client.stream_session_results(job["session_id"], replay=True):
+    ...
+```
+
+Streams use Server-Sent Events underneath and yield decoded dictionaries. The `_event` key contains `progress`, `result`, `done`, or `timeout`. `replay=True` is the default, so terminal results that finished before the client connected are sent first.
 
 ## Jobs
 
@@ -159,7 +196,7 @@ Retry a single task:
 client.retry_task(task_id, reset_attempts=True)
 ```
 
-## Client reconnect / resume
+## Client reconnect
 
 After the first submission, keep the returned reconnect credentials:
 
@@ -185,7 +222,7 @@ client = TaskGridClient(
 )
 
 sessions = client.my_sessions()
-resumed = client.resume_session(job["session_id"])
+resumed = client.reconnect_session(job["session_id"])
 results = client.session_results(job["session_id"])
 ```
 
@@ -194,6 +231,9 @@ Or attach credentials after constructing the client:
 ```python
 client.attach(client_id, resume_token)
 ```
+
+
+`reconnect_session(...)` is the reconnect/resume-token path. `resume_session(...)` is reserved for unpausing a paused service session.
 
 ## Service sessions
 
@@ -289,7 +329,16 @@ status = client.recovery_status()
 print(status["workers_stale"], status["expired_running_tasks"])
 ```
 
-Recover expired task leases:
+Reconcile manager state after a restart or suspected counter drift:
+
+```python
+summary = client.reconcile_manager()
+print(summary["jobs_reconciled"], summary["sessions_reconciled"])
+```
+
+This recomputes job/session counters and statuses from task rows. By default it also recovers expired task leases. Valid running leases are left alone, so this is safe to run after manager restarts.
+
+Recover expired task leases only:
 
 ```python
 summary = client.recover_expired_leases()
@@ -382,6 +431,7 @@ client.worker_log(worker_id, filename, tail_bytes=1_000_000)
 client.purge_offline_workers(active_seconds=None, include_running=False)
 
 client.recovery_status()
+client.reconcile_manager(recover_expired=True)
 client.recover_expired_leases()
 
 client.wait(job_id, poll_seconds=1.0, timeout_seconds=None)
@@ -391,7 +441,7 @@ client.wait(job_id, poll_seconds=1.0, timeout_seconds=None)
 
 - The SDK currently uses Python standard-library `urllib` and raises underlying HTTP/URL exceptions.
 - It does not yet expose typed response classes.
-- It does not yet include authentication headers because authentication has not been added to the manager.
+- It supports TaskGrid token authentication through `api_token` on `TaskGridClient`.
 
 ## Export helpers
 

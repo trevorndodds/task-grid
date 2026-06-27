@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.24.2 - Idempotent submission and failure recovery smoke tests
+
+- Added optional `idempotency_key` on job submission so clients can safely retry after a manager crash or lost HTTP response without creating duplicate jobs.
+- Added SDK helper `client.new_idempotency_key(...)` and `client.submit(..., idempotency_key=...)`.
+- Jobs now store `client_id` and `idempotency_key` with a per-client uniqueness guard.
+- Added regression tests for idempotent replay and live SDK replay behavior.
+- Ran local process failure tests for manager kill during submission, restart after expired leases, late duplicate completion, and restart/reconcile after partial completion.
+
+## 0.24.1 - SDK reconnect integration hardening
+
+- Fixed the Python SDK session method collision by separating reconnect-token lookup from pause/resume controls.
+- Added `client.reconnect_session(...)` for client-owned session recovery and kept `client.resume_session(...)` for unpausing a service session.
+- Added `client.resume_owned_session(...)` as a readable reconnect alias.
+- Added live manager + SDK integration coverage across submit, reconnect, pause/resume, leasing, completion, indexed results, exports, SSE replay, worker controls, retention preview, and reconcile.
+
+## 0.24.0 - Manager reconcile and restart recovery
+
+- Added `POST /maintenance/reconcile` to repair manager-derived job/session counters and statuses from durable task rows.
+- Reconcile optionally recovers expired running leases while leaving valid running leases untouched.
+- Manager startup now runs a safe reconcile pass so restart/crash recovery repairs expired leases and denormalized counters.
+- Added SDK helper `client.reconcile_manager(...)`.
+- Added a Reconcile Manager State action to the Recovery UI.
+- Added `MaintenanceReconcileRun` manager events.
+- Extended tests for counter drift repair, expired lease recovery during reconcile, valid running lease preservation, API, and UI flow.
+
+## 0.23.0 - Streaming result updates
+
+- Added Server-Sent Events result streams for jobs and service sessions.
+- Added `GET /jobs/{job_id}/results/stream` and `GET /sessions/{session_id}/results/stream`.
+- Streams emit `progress`, `result`, `done`, and `timeout` events with JSON payloads.
+- Added cursor-based terminal-task streaming using `(updated_at, task_id)` so same-millisecond completions are not skipped or duplicated.
+- Added SDK helpers `client.stream_results(...)` and `client.stream_session_results(...)`.
+- Result streams support `replay=false` for clients that only want new completions after connecting.
+- Added tests for cursor behavior and SSE endpoints.
+
+## 0.22.0 - First-class task input indexes
+
+- Added durable `input_index` and optional `input_key` fields to every task row.
+- Job submission now assigns task indexes in the same order as the submitted payload list.
+- Clients can pass `input_keys`, or TaskGrid can derive keys from payload `id`, `input_key`, or `key` fields.
+- Result APIs and exports now default to deterministic input order even when tasks finish out of order.
+- Result JSON and CSV exports include `input_index` and `input_key` for stable mapping back to client inputs.
+- Job/task/result UI tables now show input index and key.
+- Existing databases are migrated and backfilled with stable per-job input indexes.
+
 ## 0.21.0 - Session and job pause controls
 
 - Added manager/API/SDK controls to pause and resume service sessions.

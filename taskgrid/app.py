@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 import time
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from . import core, security
@@ -15,10 +16,14 @@ from .ui import router as ui_router
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    # Startup reconcile is safe: valid running leases are left alone, while
+    # expired leases and denormalized counters are repaired after a manager
+    # restart or crash.
+    core.reconcile_manager_state(recover_expired=True, updated_by="startup")
     yield
 
 
-app = FastAPI(title="TaskGrid", version="0.21.0", lifespan=lifespan)
+app = FastAPI(title="TaskGrid", version="0.24.2", lifespan=lifespan)
 app.include_router(ui_router, prefix="/ui", tags=["web-ui"])
 
 
@@ -84,6 +89,8 @@ class JobSubmit(BaseModel):
     require_capable_worker: bool = False
     client_id: str | None = None
     resume_token: str | None = None
+    input_keys: list[str | int] | None = None
+    idempotency_key: str | None = Field(None, max_length=200)
 
 
 class HeartbeatIn(BaseModel):
@@ -158,6 +165,75 @@ class SessionBulkPauseIn(BaseModel):
     reason: str | None = None
 
 
+
+
+def _sse(event: str, data: Any) -> str:
+    return f"event: {event}\ndata: {core.dumps(data)}\n\n"
+
+
+def _sse_comment(message: str) -> str:
+    clean = str(message or "").replace("\n", " ")
+    return f": {clean}\n\n"
+
+
+async def _result_stream(scope: str, entity_id: str, *, poll_seconds: float, timeout_seconds: float, replay: bool, limit: int):
+    poll = max(0.1, min(10.0, float(poll_seconds or 0.5)))
+    deadline = time.monotonic() + float(timeout_seconds) if timeout_seconds and timeout_seconds > 0 else None
+    cursor = {"updated_at": None, "task_id": None}
+    if not replay:
+        cursor = (core.latest_job_result_cursor(entity_id) if scope == "job" else core.latest_session_result_cursor(entity_id)) or cursor
+    last_progress: tuple[Any, ...] | None = None
+    while True:
+        update = (
+            core.get_job_result_updates(entity_id, after_updated_at=cursor.get("updated_at"), after_task_id=cursor.get("task_id"), limit=limit)
+            if scope == "job"
+            else core.get_session_result_updates(entity_id, after_updated_at=cursor.get("updated_at"), after_task_id=cursor.get("task_id"), limit=limit)
+        )
+        if update is None:
+            yield _sse("error", {"scope": scope, "id": entity_id, "detail": f"{scope} not found"})
+            return
+        summary = update.get("summary", {})
+        progress_key = (
+            summary.get("status"),
+            summary.get("total_tasks"),
+            summary.get("queued_tasks"),
+            summary.get("running_tasks"),
+            summary.get("completed_tasks"),
+            summary.get("failed_tasks"),
+            summary.get("cancelled_tasks"),
+        )
+        if progress_key != last_progress:
+            yield _sse("progress", {"scope": scope, "summary": summary})
+            last_progress = progress_key
+        for task in update.get("tasks", []):
+            yield _sse("result", {"scope": scope, "summary": summary, "task": task})
+        cursor = update.get("cursor") or cursor
+        if update.get("terminal") and not update.get("has_more"):
+            yield _sse("done", {"scope": scope, "summary": summary, "cursor": cursor})
+            return
+        if deadline is not None and time.monotonic() >= deadline:
+            yield _sse("timeout", {"scope": scope, "summary": summary, "cursor": cursor})
+            return
+        if not update.get("tasks"):
+            yield _sse_comment("heartbeat")
+            await asyncio.sleep(poll)
+        elif update.get("has_more"):
+            await asyncio.sleep(0)
+        else:
+            await asyncio.sleep(poll)
+
+
+def _sse_response(generator) -> StreamingResponse:
+    return StreamingResponse(
+        generator,
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     init_db()
@@ -181,9 +257,13 @@ def submit_job(payload: JobSubmit) -> dict[str, Any]:
             require_capable_worker=payload.require_capable_worker,
             client_id=payload.client_id,
             resume_token=payload.resume_token,
+            input_keys=payload.input_keys,
+            idempotency_key=payload.idempotency_key,
         )
     except core.CapabilityError as exc:
         raise HTTPException(status_code=409, detail={"message": str(exc), "capability": exc.details}) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/sessions")
@@ -249,11 +329,24 @@ def bulk_pause_sessions(payload: SessionBulkPauseIn) -> dict[str, Any]:
 
 
 @app.get("/sessions/{session_id}/results")
-def session_results(session_id: str) -> dict[str, Any]:
-    out = core.get_session_results(session_id)
+def session_results(session_id: str, order: str = Query("input", pattern="^(input|completed|finished|finished_at|started|started_at|status)$")) -> dict[str, Any]:
+    out = core.get_session_results(session_id, order=order)
     if not out:
         raise HTTPException(status_code=404, detail="session not found")
     return out
+
+
+@app.get("/sessions/{session_id}/results/stream")
+def session_results_stream(
+    session_id: str,
+    poll_seconds: float = Query(0.5, ge=0.1, le=10),
+    timeout_seconds: float = Query(0, ge=0, le=86400),
+    replay: bool = Query(True),
+    limit: int = Query(200, ge=1, le=1000),
+) -> StreamingResponse:
+    if not core.get_session(session_id):
+        raise HTTPException(status_code=404, detail="session not found")
+    return _sse_response(_result_stream("session", session_id, poll_seconds=poll_seconds, timeout_seconds=timeout_seconds, replay=replay, limit=limit))
 
 
 @app.get("/jobs")
@@ -309,15 +402,28 @@ def job_tasks(job_id: str) -> list[dict[str, Any]]:
 
 
 @app.get("/jobs/{job_id}/results")
-def job_results(job_id: str) -> dict[str, Any]:
-    out = core.get_job_results(job_id)
+def job_results(job_id: str, order: str = Query("input", pattern="^(input|completed|finished|finished_at|started|started_at|status)$")) -> dict[str, Any]:
+    out = core.get_job_results(job_id, order=order)
     if not out:
         raise HTTPException(status_code=404, detail="job not found")
     return out
 
 
+@app.get("/jobs/{job_id}/results/stream")
+def job_results_stream(
+    job_id: str,
+    poll_seconds: float = Query(0.5, ge=0.1, le=10),
+    timeout_seconds: float = Query(0, ge=0, le=86400),
+    replay: bool = Query(True),
+    limit: int = Query(200, ge=1, le=1000),
+) -> StreamingResponse:
+    if not core.get_job(job_id):
+        raise HTTPException(status_code=404, detail="job not found")
+    return _sse_response(_result_stream("job", job_id, poll_seconds=poll_seconds, timeout_seconds=timeout_seconds, replay=replay, limit=limit))
+
+
 @app.get("/jobs/{job_id}/results/export")
-def job_results_export(job_id: str, format: str = Query("json", pattern="^(json|csv)$"), order: str = "input", failed_only: bool = False) -> Response:
+def job_results_export(job_id: str, format: str = Query("json", pattern="^(json|csv)$"), order: str = Query("input", pattern="^(input|completed|finished|finished_at|started|started_at|status)$"), failed_only: bool = False) -> Response:
     out = core.export_job_results(job_id, fmt=format, order=order, failed_only=failed_only)
     if not out:
         raise HTTPException(status_code=404, detail="job not found")
@@ -326,7 +432,7 @@ def job_results_export(job_id: str, format: str = Query("json", pattern="^(json|
 
 
 @app.get("/sessions/{session_id}/results/export")
-def session_results_export(session_id: str, format: str = Query("json", pattern="^(json|csv)$"), order: str = "input", failed_only: bool = False) -> Response:
+def session_results_export(session_id: str, format: str = Query("json", pattern="^(json|csv)$"), order: str = Query("input", pattern="^(input|completed|finished|finished_at|started|started_at|status)$"), failed_only: bool = False) -> Response:
     out = core.export_session_results(session_id, fmt=format, order=order, failed_only=failed_only)
     if not out:
         raise HTTPException(status_code=404, detail="session not found")
@@ -481,6 +587,11 @@ def maintenance_status() -> dict[str, Any]:
 @app.post("/maintenance/recover")
 def maintenance_recover() -> dict[str, Any]:
     return core.recover_expired_leases(updated_by="api")
+
+
+@app.post("/maintenance/reconcile")
+def maintenance_reconcile(recover_expired: bool = Query(True)) -> dict[str, Any]:
+    return core.reconcile_manager_state(recover_expired=recover_expired, updated_by="api")
 
 
 @app.get("/manager/log", response_class=PlainTextResponse)

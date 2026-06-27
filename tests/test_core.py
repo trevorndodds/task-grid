@@ -20,6 +20,51 @@ def test_job_success_flow():
         assert final["completed_tasks"] == 2
 
 
+def test_task_input_index_and_key_make_results_deterministic():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/input-order.db"
+        from taskgrid import core
+
+        job = core.create_job(
+            "indexed",
+            "echo",
+            [{"n": 1}, {"n": 2}, {"n": 3}],
+            input_keys=["row-a", "row-b", "row-c"],
+        )
+        tasks = core.list_tasks(job["id"])
+        assert [task["input_index"] for task in tasks] == [0, 1, 2]
+        assert [task["input_key"] for task in tasks] == ["row-a", "row-b", "row-c"]
+
+        leased = core.lease_tasks("node-order", limit=3)
+        # Finish out of input order; normal result reads should still come back
+        # in the client-submitted input order.
+        for task in reversed(leased):
+            core.complete_task(task["id"], "node-order", {"seen": task["input_key"]})
+
+        results = core.get_job_results(job["id"])
+        assert [item["input_index"] for item in results["tasks"]] == [0, 1, 2]
+        assert [item["input_key"] for item in results["tasks"]] == ["row-a", "row-b", "row-c"]
+        assert [item["result"]["seen"] for item in results["tasks"]] == ["row-a", "row-b", "row-c"]
+
+
+def test_input_key_can_be_derived_from_payload_and_survives_retry():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/input-key-retry.db"
+        from taskgrid import core
+
+        job = core.create_job("derived keys", "echo", [{"id": "invoice-1"}], max_retries=0)
+        task = core.lease_tasks("node-key", limit=1)[0]
+        assert task["input_index"] == 0
+        assert task["input_key"] == "invoice-1"
+
+        failed = core.fail_task(task["id"], "node-key", "boom")
+        assert failed["status"] == "failed"
+        retried = core.retry_task(task["id"])
+        assert retried["status"] == "queued"
+        assert retried["input_index"] == 0
+        assert retried["input_key"] == "invoice-1"
+
+
 def test_failure_retries_then_fails():
     with tempfile.TemporaryDirectory() as tmp:
         os.environ["TASKGRID_DB"] = f"{tmp}/test.db"
@@ -491,7 +536,7 @@ def test_batch_lease_assigns_distinct_instances_and_completes():
         os.environ["TASKGRID_DB"] = f"{tmp}/batch.db"
         from taskgrid import core
 
-        job = core.create_job("batch", "echo", [{"n": i} for i in range(4)])
+        job = core.create_job("batch", "echo", [{"id": f"row-{i}", "n": i} for i in range(4)])
         core.heartbeat_worker("node-a", metadata={"task_types": ["echo"], "configured_instances": 4})
         leased = core.lease_tasks_for_instances("node-a", ["instance-001", "instance-002", "instance-003"], lease_seconds=30)
         assert len(leased) == 3
@@ -500,6 +545,8 @@ def test_batch_lease_assigns_distinct_instances_and_completes():
             "node-a-instance-002",
             "node-a-instance-003",
         }
+        assert [item["input_index"] for item in leased] == [0, 1, 2]
+        assert [item["input_key"] for item in leased] == ["row-0", "row-1", "row-2"]
         for item in leased:
             core.complete_task(item["id"], "node-a", {"ok": item["leased_instance_id"]}, instance_id=item["leased_instance_id"])
         assert core.get_job(job["id"])["completed_tasks"] == 3
@@ -522,7 +569,7 @@ def test_result_exports_json_csv_and_failed_only():
 
         csv_body, csv_media, csv_name = core.export_job_results(job["id"], fmt="csv")
         assert csv_media.startswith("text/csv")
-        assert "task_id,job_id" in csv_body
+        assert csv_body.startswith("input_index,input_key,task_id,job_id")
         assert csv_name.endswith("results.csv")
 
         failed_csv, _, failed_name = core.export_job_results(job["id"], fmt="csv", failed_only=True)
@@ -690,3 +737,170 @@ def test_paused_job_blocks_leasing_without_pausing_whole_session():
         leased_again = core.lease_tasks("node-a", limit=1)
         assert len(leased_again) == 1
         assert leased_again[0]["job_id"] == first["id"]
+
+
+def test_job_result_updates_stream_cursor_returns_each_terminal_task_once():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/stream-cursor.db"
+        from taskgrid import core
+
+        job = core.create_job("stream cursor", "echo", [{"id": "a"}, {"id": "b"}], max_retries=0)
+        first, second = core.lease_tasks("node-stream", limit=2)
+        core.complete_task(first["id"], "node-stream", {"ok": "a"})
+
+        update = core.get_job_result_updates(job["id"])
+        assert update is not None
+        assert update["terminal"] is False
+        assert [task["task_id"] for task in update["tasks"]] == [first["id"]]
+        assert update["tasks"][0]["input_key"] == "a"
+        cursor = update["cursor"]
+
+        assert core.get_job_result_updates(job["id"], after_updated_at=cursor["updated_at"], after_task_id=cursor["task_id"])["tasks"] == []
+
+        core.fail_task(second["id"], "node-stream", "boom")
+        update2 = core.get_job_result_updates(job["id"], after_updated_at=cursor["updated_at"], after_task_id=cursor["task_id"])
+        assert update2 is not None
+        assert update2["terminal"] is True
+        assert [task["task_id"] for task in update2["tasks"]] == [second["id"]]
+        assert update2["tasks"][0]["status"] == "failed"
+        assert update2["summary"]["failed_tasks"] == 1
+
+
+def test_session_result_updates_stream_across_jobs():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/session-stream.db"
+        from taskgrid import core
+
+        first_job = core.create_job("first stream job", "echo", [{"id": "a"}], session_name="stream session")
+        second_job = core.create_job("second stream job", "echo", [{"id": "b"}], session_id=first_job["session_id"])
+        first_task, second_task = core.lease_tasks("session-node", limit=2)
+        core.complete_task(second_task["id"], "session-node", {"seen": second_task["input_key"]})
+        core.complete_task(first_task["id"], "session-node", {"seen": first_task["input_key"]})
+
+        update = core.get_session_result_updates(first_job["session_id"])
+        assert update is not None
+        assert update["terminal"] is True
+        assert {task["job_id"] for task in update["tasks"]} == {first_job["id"], second_job["id"]}
+        assert {task["input_key"] for task in update["tasks"]} == {"a", "b"}
+        assert update["summary"]["total_jobs"] == 2
+        assert core.latest_session_result_cursor(first_job["session_id"])["task_id"] in {first_task["id"], second_task["id"]}
+
+
+def test_reconcile_repairs_job_and_session_counters_from_task_rows():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/reconcile-counters.db"
+        from taskgrid import core
+
+        job = core.create_job("reconcile counters", "echo", [{"n": 1}, {"n": 2}, {"n": 3}], max_retries=0)
+        first, second = core.lease_tasks("node-r", limit=2)
+        core.complete_task(first["id"], "node-r", {"ok": 1})
+        core.fail_task(second["id"], "node-r", "boom")
+
+        with core.connection() as conn:
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status='succeeded', total_tasks=999, completed_tasks=999,
+                    failed_tasks=0, cancelled_tasks=0, finished_at='2000-01-01T00:00:00+00:00'
+                WHERE id=?
+                """,
+                (job["id"],),
+            )
+            conn.execute(
+                """
+                UPDATE service_sessions
+                SET status='succeeded', total_jobs=99, total_tasks=999,
+                    queued_tasks=0, running_tasks=0, completed_tasks=999,
+                    failed_tasks=0, cancelled_tasks=0, finished_at='2000-01-01T00:00:00+00:00'
+                WHERE id=?
+                """,
+                (job["session_id"],),
+            )
+
+        summary = core.reconcile_manager_state(recover_expired=False, updated_by="test")
+        assert summary["jobs_checked"] == 1
+        assert summary["sessions_checked"] == 1
+        assert summary["jobs_reconciled"] == 1
+        assert summary["sessions_reconciled"] == 1
+        assert summary["lease_recovery"]["skipped"] is True
+
+        repaired_job = core.get_job(job["id"])
+        assert repaired_job is not None
+        assert repaired_job["status"] == "running"
+        assert repaired_job["total_tasks"] == 3
+        assert repaired_job["completed_tasks"] == 1
+        assert repaired_job["failed_tasks"] == 1
+        assert repaired_job["cancelled_tasks"] == 0
+        assert repaired_job["finished_at"] is None
+
+        repaired_session = core.get_session(job["session_id"])
+        assert repaired_session is not None
+        assert repaired_session["status"] == "running"
+        assert repaired_session["total_jobs"] == 1
+        assert repaired_session["total_tasks"] == 3
+        assert repaired_session["queued_tasks"] == 1
+        assert repaired_session["running_tasks"] == 0
+        assert repaired_session["completed_tasks"] == 1
+        assert repaired_session["failed_tasks"] == 1
+        assert repaired_session["finished_at"] is None
+        assert core.list_events(code="MaintenanceReconcileRun", limit=1)
+
+
+def test_reconcile_recovers_expired_leases_but_keeps_valid_running_leases():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/reconcile-leases.db"
+        from taskgrid import core
+
+        expired_job = core.create_job("expired", "echo", [{"n": 1}], max_retries=1)
+        valid_job = core.create_job("valid", "echo", [{"n": 2}], max_retries=1)
+        expired = core.lease_tasks("node-expired", limit=1, lease_seconds=30, instance_id="instance-001")[0]
+        valid = core.lease_tasks("node-valid", limit=1, lease_seconds=3600, instance_id="instance-001")[0]
+        with core.connection() as conn:
+            conn.execute("UPDATE tasks SET lease_expires_at=? WHERE id=?", ("2000-01-01T00:00:00+00:00", expired["id"]))
+
+        summary = core.reconcile_manager_state(recover_expired=True, updated_by="test")
+        assert summary["lease_recovery"]["expired"] == 1
+        assert summary["lease_recovery"]["requeued"] == 1
+
+        expired_after = core.get_task(expired["id"])
+        valid_after = core.get_task(valid["id"])
+        assert expired_after is not None and expired_after["status"] == "queued"
+        assert valid_after is not None and valid_after["status"] == "running"
+        assert valid_after["assigned_worker_id"] == "node-valid-instance-001"
+        assert core.get_job(expired_job["id"])["status"] == "queued"
+        assert core.get_job(valid_job["id"])["status"] == "running"
+
+
+def test_idempotent_job_submit_replays_existing_job_for_retry():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/idempotent-submit.db"
+        from taskgrid import core
+
+        first = core.create_job(
+            "idempotent",
+            "echo",
+            [{"n": 1}, {"n": 2}],
+            client_id="client-a",
+            idempotency_key="submit-123",
+        )
+        second = core.create_job(
+            "idempotent retry",
+            "echo",
+            [{"n": 999}],
+            client_id="client-a",
+            idempotency_key="submit-123",
+        )
+
+        assert second["id"] == first["id"]
+        assert second["session_id"] == first["session_id"]
+        assert second["resume_token"] == first["resume_token"]
+        assert len(core.list_tasks(first["id"])) == 2
+
+        other = core.create_job(
+            "same key different client",
+            "echo",
+            [{"n": 3}],
+            client_id="client-b",
+            idempotency_key="submit-123",
+        )
+        assert other["id"] != first["id"]

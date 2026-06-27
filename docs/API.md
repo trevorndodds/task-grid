@@ -131,6 +131,7 @@ Request body:
     {"x": 2},
     {"x": 3}
   ],
+  "input_keys": ["row-1", "row-2", "row-3"],
   "priority": null,
   "session_priority": 10,
   "max_retries": 2,
@@ -139,7 +140,8 @@ Request body:
   "session_name": "Morning Square Run",
   "session_metadata": {},
   "client_id": "client-alpha",
-  "resume_token": null
+  "resume_token": null,
+  "idempotency_key": "submit-2026-06-27-001"
 }
 ```
 
@@ -150,12 +152,16 @@ Fields:
 | `name` | yes | Human-readable job name. |
 | `task_type` | yes | Must match a task registered on eligible workers. |
 | `tasks` | yes | List of JSON payloads. One task row is created per payload. |
+| `input_keys` | no | Optional stable keys matching `tasks` length. If omitted, TaskGrid derives keys from payload `id`, `input_key`, or `key` when present. |
+| `idempotency_key` | no | Optional per-client submit key. Reusing the same `client_id` + `idempotency_key` returns the existing job, which makes retries safe after network loss or manager restart. |
 | `priority` | no | Job/task priority override. If omitted, uses `session_priority` or existing session priority. |
 | `session_priority` | no | Priority for the service session. Higher priority leases first. |
 | `max_retries` | no | Automatic retry count for failed tasks. Default `2`. |
 | `metadata` | no | Job metadata. Use `required_tags` here for routing. |
 | `session_id` | no | Attach this job to an existing session. |
 | `session_name` | no | Create a named session when `session_id` is omitted. |
+| `client_id` | no | Stable client owner id. Use one with `idempotency_key` when submit retries must survive a lost response. |
+| `resume_token` | no | Token used to attach to existing owned sessions. |
 | `session_metadata` | no | Metadata for a newly created session. |
 | `client_id` | no | Client owner for reconnect/list-my-sessions flows. Generated if omitted. |
 | `resume_token` | no | Bearer-style reconnect token. Generated for new sessions if omitted; required for client-owned resume/list APIs. |
@@ -250,39 +256,74 @@ GET /jobs/{job_id}/tasks
 ### Get job results
 
 ```http
-GET /jobs/{job_id}/results
+GET /jobs/{job_id}/results?order=input
 ```
+
+`order` defaults to `input` and can be `input`, `started`, `started_at`, `completed`, `finished`, `finished_at`, or `status`. Input order uses first-class `input_index`, so results remain stable even when tasks finish out of order.
 
 Example response shape:
 
 ```json
 {
-  "job": {
-    "id": "job_abc123",
-    "session_id": "sess_def456",
-    "name": "square numbers",
-    "status": "succeeded"
-  },
-  "results": [
+  "job_id": "job_abc123",
+  "session_id": "sess_def456",
+  "name": "square numbers",
+  "status": "succeeded",
+  "tasks": [
     {
-      "id": "task_001",
+      "task_id": "task_001",
       "job_id": "job_abc123",
       "task_type": "square",
+      "input_index": 0,
+      "input_key": "row-1",
       "status": "succeeded",
       "payload": {"x": 2},
       "result": {"x": 2, "square": 4},
       "error": null,
       "attempts": 1,
-      "worker_id": "node-a",
-      "instance_id": "instance-001",
-      "executor_id": "node-a-instance-001",
+      "assigned_worker_id": "node-a-instance-001",
       "started_at": "2026-06-26T18:00:01.000+00:00",
       "finished_at": "2026-06-26T18:00:01.050+00:00",
       "payload_bytes": 7,
       "result_bytes": 20
     }
+  ],
+  "results": [
+    {
+      "task_id": "task_001",
+      "input_index": 0,
+      "input_key": "row-1",
+      "status": "succeeded",
+      "result": {"x": 2, "square": 4},
+      "error": null
+    }
   ]
 }
+```
+
+
+### Stream job results
+
+```http
+GET /jobs/{job_id}/results/stream?poll_seconds=0.5&timeout_seconds=0&replay=true
+Accept: text/event-stream
+```
+
+Streams Server-Sent Events for async clients. Event names are:
+
+- `progress`: current job counters/status.
+- `result`: one newly terminal task result, including `input_index`, `input_key`, payload, result/error, worker, attempts, and timing.
+- `done`: job is terminal and all terminal task results up to the final cursor were sent.
+- `timeout`: `timeout_seconds` was reached before the job finished.
+
+`replay=true` sends already terminal task results before waiting for new ones. Use `replay=false` when reconnecting clients only want completions after the stream opens. The cursor uses `(updated_at, task_id)` and is independent of manager logs.
+
+Example SSE frame:
+
+```text
+event: result
+data: {"scope":"job","task":{"task_id":"task_001","input_index":0,"input_key":"row-1","status":"succeeded","result":{"ok":true}}}
+
 ```
 
 ### Cancel job
@@ -524,6 +565,16 @@ To reject early instead, send:
 If no active worker advertises that task type and tag set, the manager returns HTTP `409` with capability details.
 
 
+
+### Stream session results
+
+```http
+GET /sessions/{session_id}/results/stream?poll_seconds=0.5&timeout_seconds=0&replay=true
+Accept: text/event-stream
+```
+
+Streams the same `progress`, `result`, `done`, and `timeout` event types across every job in the service session. Each result includes `job_id` and `job_name` so clients can route completions back to the originating job.
+
 ## Workers
 
 ### List workers
@@ -650,6 +701,26 @@ Returns manager-side health and recovery state:
 }
 ```
 
+### Reconcile manager state
+
+```http
+POST /maintenance/reconcile?recover_expired=true
+```
+
+Repairs manager-derived state from durable task rows. The reconcile pass recomputes job counters, session counters, and job/session statuses, then optionally recovers expired running leases. Valid running leases are not touched, so this endpoint is safe after manager restarts.
+
+Example response fields:
+
+```json
+{
+  "jobs_checked": 12,
+  "sessions_checked": 4,
+  "jobs_reconciled": 1,
+  "sessions_reconciled": 1,
+  "lease_recovery": {"expired": 1, "requeued": 1, "failed": 0}
+}
+```
+
 ### Recover expired leases
 
 ```http
@@ -661,6 +732,7 @@ Requeues expired running tasks that still have retry attempts left. If retries a
 Important events:
 
 ```text
+MaintenanceReconcileRun
 MaintenanceRecoveryRun
 TaskLeaseExpiredRequeued
 TaskLeaseExpiredFailed
@@ -789,6 +861,23 @@ Request:
 }
 ```
 
+Idempotent submit retry:
+
+```bash
+# First call may commit, then the client may lose the HTTP response if the
+# manager is killed or the network drops. Retrying with the same client_id and
+# idempotency_key returns the original job instead of creating a duplicate.
+curl -X POST http://127.0.0.1:8000/jobs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "safe submit",
+    "task_type": "square",
+    "tasks": [{"x":1}],
+    "client_id": "client-alpha",
+    "idempotency_key": "safe-submit-001"
+  }'
+```
+
 Response:
 
 ```json
@@ -868,7 +957,7 @@ Session priority affects queued tasks across the session. Job priority can overr
 - Log endpoints return plain text.
 - Unknown entities return HTTP `404` with a FastAPI detail body.
 - Worker log proxy failures return HTTP `502`.
-- No authentication is implemented yet in this MVP.
+- Authentication is optional and controlled by the `TASKGRID_*_TOKEN` environment variables.
 
 
 ## Scale benchmark utility
@@ -880,9 +969,11 @@ The API package includes `scripts/benchmark_scale.py`, which launches a temporar
 Download full result sets or failed-task reports without scraping the UI.
 
 ```text
-GET /jobs/{job_id}/results/export?format=json|csv&order=input|started|completed&failed_only=false
-GET /sessions/{session_id}/results/export?format=json|csv&order=input|started|completed&failed_only=false
+GET /jobs/{job_id}/results/export?format=json|csv&order=input|started|completed|status&failed_only=false
+GET /sessions/{session_id}/results/export?format=json|csv&order=input|started|completed|status&failed_only=false
 ```
+
+CSV exports include `input_index,input_key,task_id,job_id,...` so clients can map rows back to submitted inputs deterministically.
 
 Examples:
 
