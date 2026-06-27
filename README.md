@@ -8,12 +8,17 @@ A tiny, boring, useful distributed task manager for grid-style workloads:
 - jobs can require worker capability tags such as `gpu` or `risk-model-v2`
 - workers advertise task types and the manager exposes a task catalog / capability checker
 - failed tasks retry automatically, and operators can manually retry failed tasks
+- expired leases can be recovered when a worker dies mid-task
+- stale workers and stuck/expired task leases are visible from the Recovery UI
+- workers can be disabled/enabled from the manager so nodes can be drained without deleting history
+- sessions and individual jobs can be paused/resumed so queued work is held without cancelling running tasks
 - each single-task instance writes to its own instance folder, exposed by the node log API
 - the broker proxies worker logs so operators can view them from the manager UI
 - service sessions group client submissions and show job/task counts, pending/running/completed totals, start time, and end time
 - results and logs are queryable
-- the broker writes a manager-side JSONL audit log with event codes such as `TaskAccepted` and `TaskCompleted`
-- a lightweight server-rendered web UI shows jobs, tasks, workers, events, results, retry controls, logs, and a submit form
+- durable task/job/session rows are the source of truth for tracking; verbose successful task lifecycle events are debug-only
+- the broker writes a manager-side JSONL audit log for operational events such as submissions, warnings, failures, recovery, and admin actions
+- a lightweight server-rendered web UI shows jobs, tasks, workers, events, results, retry controls, recovery state, logs, and a submit form
 
 This is **not** a drop-in clone of any enterprise grid product. It is a clean minimal distributed task runner.
 
@@ -34,6 +39,19 @@ When the manager is running, FastAPI also exposes interactive docs at:
 /openapi.json
 ```
 
+## Operational controls
+
+TaskGrid separates scheduling holds from cancellation:
+
+```text
+Pause session/job   -> queued work stays queued, no new leases are issued
+Resume session/job  -> queued work becomes eligible again
+Cancel job          -> queued work is cancelled; running work may finish gracefully
+Disable worker      -> node keeps history/logs but receives no new leases
+```
+
+Pause is useful when a client run should wait behind maintenance, investigation, or a priority decision. It does not delete results, cancel running work, or reset attempts.
+
 ## Architecture
 
 ```text
@@ -43,7 +61,7 @@ Service Session + Job submission
         ↓
 FastAPI broker
         ↓
-SQLite session/job/task/event store + manager.log JSONL audit log
+SQLite session/job/task state store + optional event/manager.log trace
         ↓
 HTTP polling worker instances
         ↓
@@ -75,20 +93,30 @@ Terminal 2:
 python -m taskgrid.worker --module examples.custom_tasks --worker-id node-a --instances 2
 ```
 
-By default the manager writes a broker-side JSONL audit log beside the SQLite database:
+By default the manager writes a broker-side JSONL operational log beside the SQLite database:
 
 ```text
 manager.log
 ```
 
-Each line includes a stable event code, for example:
+Normal mode records important operational events such as `JobSubmitted`, capability warnings, failures, recovery actions, ignored late results, and admin/config changes. Successful high-volume per-task events such as `TaskAccepted` and `TaskCompleted` are intentionally suppressed in normal mode because the task rows already store authoritative tracking fields: status, assigned worker instance, attempts, start time, finish time, result, and error.
 
-```json
-{"code":"TaskAccepted","entity_type":"task","entity_id":"task_...","data":{"worker_id":"node-a:instance-001"}}
-{"code":"TaskCompleted","entity_type":"task","entity_id":"task_...","data":{"worker_id":"node-a:instance-001"}}
+Enable verbose task lifecycle tracing only when debugging:
+
+```bash
+export TASKGRID_EVENT_MODE=debug
+# or
+export TASKGRID_VERBOSE_TASK_EVENTS=1
 ```
 
-Override the path with:
+In debug mode, manager log lines include stable event codes and execution slots such as:
+
+```json
+{"code":"TaskAccepted","entity_type":"task","entity_id":"task_...","data":{"worker_id":"node-a","instance_id":"instance-001","executor_id":"node-a-instance-001"}}
+{"code":"TaskCompleted","entity_type":"task","entity_id":"task_...","data":{"worker_id":"node-a","instance_id":"instance-001","executor_id":"node-a-instance-001"}}
+```
+
+Override the manager log path with:
 
 ```bash
 export TASKGRID_MANAGER_LOG=/var/log/taskgrid/manager.log
@@ -118,6 +146,16 @@ python -m taskgrid.worker --module examples.custom_tasks --instances 4 --tag gpu
 
 A worker node supervises logical single-task instances. `--instances 4` means the node can run four tasks at the same time, but each instance runs only one task and writes to its own `worker.log`. `--concurrency` is kept as a deprecated alias for `--instances`.
 
+Worker execution modes:
+
+```bash
+--execution-mode process  # default; process isolation for CPU-heavy work
+--execution-mode thread   # lower overhead for trusted tiny/I/O-heavy work
+--execution-mode inline   # lowest overhead, no isolation; trusted code only
+```
+
+For realistic compute tasks, keep `process`. For overload tests with thousands of tiny tasks, `thread` avoids process-management overhead so the benchmark measures the manager/broker path more directly.
+
 Terminal 3:
 
 ```bash
@@ -132,6 +170,59 @@ http://127.0.0.1:8000/ui
 
 `/admin` redirects to `/ui` for convenience.
 
+
+
+## Optional security
+
+TaskGrid is open by default for local development. To protect a manager, set one or more tokens before starting it:
+
+```bash
+export TASKGRID_ADMIN_TOKEN=admin-secret
+export TASKGRID_CLIENT_TOKEN=client-secret
+export TASKGRID_WORKER_TOKEN=worker-secret
+export TASKGRID_UI_TOKEN=ui-secret
+```
+
+Tokens are supplied with `X-TaskGrid-Token` or `Authorization: Bearer ...`. The admin token is accepted for all protected API routes. Client tokens cover job/session/result APIs. Worker tokens cover heartbeat, lease, complete, and fail APIs. UI tokens protect `/ui`; if only `TASKGRID_ADMIN_TOKEN` is set, the admin token can also be used on the UI login screen.
+
+Worker example:
+
+```bash
+python -m taskgrid.worker   --broker http://127.0.0.1:8000   --worker-token worker-secret   --module examples.custom_tasks   --instances 4
+```
+
+SDK example:
+
+```python
+client = TaskGridClient("http://127.0.0.1:8000", api_token="client-secret")
+```
+
+For production, set all three API tokens and a UI token, run the manager behind TLS, and avoid exposing worker log APIs directly to untrusted networks.
+
+## Cancellation behavior
+
+TaskGrid cancellation is graceful by default:
+
+```text
+queued tasks    -> cancelled immediately
+running tasks   -> allowed to finish
+job/session     -> cancelling until running tasks finish
+late results    -> do not revive cancelled work
+```
+
+API/SDK examples:
+
+```bash
+POST /jobs/{job_id}/cancel?mode=graceful
+POST /jobs/{job_id}/cancel?mode=force
+```
+
+```python
+client.cancel(job_id)                 # graceful
+client.cancel(job_id, mode="force")   # immediate/force cancel
+```
+
+The UI exposes both **Graceful Cancel** and **Force Cancel** on the job detail page.
 
 ## Web UI
 
@@ -183,7 +274,7 @@ GET /sessions/{session_id}/jobs
 GET /sessions/{session_id}/results
 ```
 
-A job response includes its `session_id`. To attach another job to an existing session, pass `session_id` when submitting. To name a new session explicitly, pass `session_name`:
+A job response includes `session_id`, `client_id`, and `resume_token`. To attach another job to an existing session, pass `session_id` when submitting. To name a new session explicitly, pass `session_name`:
 
 ```python
 client.submit(
@@ -203,6 +294,26 @@ The web UI exposes this at:
 ```text
 /ui/sessions
 /ui/sessions/{session_id}
+/ui/client-sessions
+```
+
+Clients can disconnect after submit and later reconnect if they kept their `client_id` and `resume_token`:
+
+```python
+job = client.submit(
+    name="risk batch",
+    task_type="square",
+    tasks=[{"x": 2}],
+    session_name="Risk Run",
+)
+
+client_id = job["client_id"]
+resume_token = job["resume_token"]
+
+# Later, possibly in a new process:
+client = TaskGridClient("http://127.0.0.1:8000", client_id=client_id, resume_token=resume_token)
+print(client.my_sessions())
+print(client.session_results(job["session_id"]))
 ```
 
 Session priority controls queued work across the session. Changing priority updates the session, non-terminal jobs in that session, and queued tasks. Running tasks are not interrupted; completed tasks are unchanged. Job-level `priority` remains available as an override, but if omitted, jobs inherit the session priority.
@@ -621,6 +732,8 @@ GET  /health
 POST /jobs
 GET  /sessions
 GET  /sessions/{session_id}
+GET  /clients/{client_id}/sessions
+GET  /clients/{client_id}/sessions/{session_id}
 POST /sessions/{session_id}/priority
 GET  /sessions/{session_id}/jobs
 GET  /sessions/{session_id}/results
@@ -635,11 +748,13 @@ GET  /workers/{worker_id}/logs
 GET  /workers/{worker_id}/logs/{filename}
 GET  /workers/{worker_id}/config
 POST /workers/{worker_id}/config
+POST /workers/purge-offline
 GET  /events
 GET  /ui
 GET  /ui/sessions
 GET  /ui/sessions/{session_id}
 GET  /ui/sessions/{session_id}/results
+GET  /ui/client-sessions
 GET  /ui/jobs
 GET  /ui/jobs/{job_id}
 GET  /ui/jobs/{job_id}/results
@@ -647,6 +762,7 @@ POST /ui/jobs/{job_id}/retry-failed
 GET  /ui/tasks/{task_id}
 POST /ui/tasks/{task_id}/retry
 GET  /ui/workers
+POST /ui/workers/purge-offline
 GET  /ui/workers/{worker_id}/logs
 GET  /ui/workers/{worker_id}/logs/{filename}
 GET  /ui/manager/data-flow
@@ -666,41 +782,62 @@ POST /tasks/{task_id}/fail
 POST /tasks/{task_id}/retry
 ```
 
-## Round 5 additions
+## Operational capabilities
 
-This round adds the single-task instance model and cleaner logs:
+### Recovery and stale worker handling
 
-- A worker node manages N logical instances with `--instances N`; `--concurrency` remains a deprecated alias.
-- Each logical instance can run only one task at a time.
+TaskGrid treats task leases as recoverable. If a worker node or container dies mid-task, the manager can detect expired running leases and either requeue the task or fail it when retries are exhausted. Operators can view this from:
+
+```text
+/ui/manager/recovery
+```
+
+Programmatic endpoints are also available:
+
+```text
+GET  /maintenance/status
+POST /maintenance/recover
+POST /workers/purge-offline
+```
+
+Late or duplicate results from an old worker are ignored and recorded with manager events such as `TaskResultIgnored` or `TaskFailureIgnored`.
+
+Offline workers stay in the manager registry after their last heartbeat so operators can see what disappeared. They can be purged from `/ui/workers`, `/ui/manager/recovery`, or `POST /workers/purge-offline`. Purging removes stale worker/config rows only; jobs, tasks, results, events, and remote worker logs are preserved. Workers with running task assignments are skipped by default.
+
+
+### Worker capacity and instance control
+
+- A worker node manages N logical single-task instances with `--instances N`; `--concurrency` remains only as a deprecated alias.
+- One worker node can run multiple tasks at once by supervising multiple independent instances.
+- Each instance can run only one task at a time.
+- Desired instance counts can be changed from `/ui/workers` or `POST /workers/{worker_id}/config`.
+- Increasing the desired instance count starts more loops; shrinking waits for extra instances to finish current work before stopping.
+- The dashboard and Workers page show busy instances, desired instances, active tasks, tags, and heartbeat age.
+
+### Capability-aware scheduling
+
+- Workers can advertise tags with `python -m taskgrid.worker --tag gpu --tag risk-model-v2`.
+- Jobs can set `metadata.required_tags`, so only matching workers lease those tasks.
+- Workers also advertise loaded task types, service name, service version, tags, modules, and instance state.
+- `/ui/task-catalog` shows which active workers can run each task type.
+- `GET /task-catalog?task_type=square` returns task capability data for API clients.
+- Submissions can set `require_capable_worker=true` to reject work when no active capable worker is online.
+
+### Retries and recovery controls
+
+- Failed tasks retry automatically up to the task/job retry limit.
+- Operators can manually retry one failed task.
+- Operators can retry all failed tasks in a job.
+- Retry controls are available from the task detail and job detail pages.
+
+### Logging and traceability
+
 - Instance logs live under `taskgrid_logs/<worker-id>/instances/<instance-id>/worker.log`.
-- Node lifecycle/log-proxy messages live in `taskgrid_logs/<worker-id>/supervisor.log`.
+- Node lifecycle and log-proxy messages live in `taskgrid_logs/<worker-id>/supervisor.log`.
 - Task stdout/stderr and tracebacks are embedded into bounded `TASK ... START/END` sections in the relevant instance `worker.log`.
-- Removed task-section file locking because one instance cannot have two active tasks writing to the same log.
+- In debug/verbose event mode, successful task events in `manager.log` include the execution slot in `node-id-instance-id` form. In normal mode, task rows/results/counters provide the authoritative tracking without writing accept/complete event lines for every tiny task.
 - The main worker node process exposes supervisor and instance logs through the local HTTP log API.
 - The broker/UI can proxy nested log paths such as `instances/instance-001/worker.log`.
-
-## Round 4 additions
-
-This round adds the first real node-management features:
-
-- Earlier process-pool worker concurrency via `--concurrency N` has been superseded by `--instances N`.
-- One worker node can still run multiple tasks at once by supervising multiple single-task instances.
-- Broker-managed desired instance count per worker/node, stored in the existing config column for compatibility.
-- Workers safely restart their instance pool to apply UI/API config changes.
-- Workers UI can set desired instances per node.
-- Dashboard shows busy and configured worker instances.
-- Extra tests for worker config and UI updates.
-
-## Round 3 additions
-
-This round adds small but important operational features:
-
-- Worker capability tags via `python -m taskgrid.worker --tag gpu`.
-- Job metadata `required_tags`, so only matching workers lease those tasks.
-- Manual retry for one failed task.
-- Manual retry for all failed tasks in a job.
-- Retry buttons in the web UI.
-- Extra core tests for worker-tag scheduling and manual requeue.
 
 ## Current MVP limits
 
@@ -728,6 +865,130 @@ This round adds small but important operational features:
 9. Add a React admin UI if the server-rendered UI becomes too limiting.
 
 
-## Task catalog / capabilities
 
-Workers advertise loaded task types and tags in heartbeat metadata. Open `/ui/task-catalog` to see which workers can run each task type, or call `GET /task-catalog?task_type=square`. Submissions can set `require_capable_worker=true` to reject work when no active capable worker is online.
+### Scale benchmarking
+
+TaskGrid includes a local benchmark harness for manager/worker/client scale checks:
+
+```bash
+python scripts/benchmark_scale.py --workers 4 --instances-per-worker 1 --clients 8 --tasks-per-client 50
+python scripts/benchmark_scale.py --workers 1 --instances-per-worker 8 --clients 8 --tasks-per-client 50
+python scripts/benchmark_scale.py --workers 4 --instances-per-worker 4 --clients 16 --tasks-per-client 100
+python scripts/benchmark_scale.py --workers 4 --instances-per-worker 100 --clients 8 --tasks-per-client 100 --execution-mode thread
+```
+
+The benchmark starts a temporary manager, launches worker processes, submits concurrent client jobs, waits for completion, and prints JSON with task throughput, worker counts, stale workers, expired leases, and task state totals from SQLite. If debug event mode is enabled, it also reports verbose task lifecycle event counts. It uses a temporary SQLite database and log folder by default.
+
+Observed local smoke results from this package:
+
+| Shape | Tasks | Result | Throughput | Notes |
+|---|---:|---|---:|---|
+| 4 worker nodes × 1 instance | 400 | 400 succeeded / 0 failed | ~115 tasks/sec | baseline multi-node test |
+| 1 worker node × 8 instances | 400 | 400 succeeded / 0 failed | ~105 tasks/sec | validates bounded session pool inside one node |
+| 8 worker nodes × 2 instances | 1,600 | 1,600 succeeded / 0 failed | ~117 tasks/sec | larger multi-node test |
+| 4 worker nodes × 4 instances | 1,600 | 1,600 succeeded / 0 failed | ~106 tasks/sec | larger multi-instance test |
+
+These are tiny `square` tasks, so they mostly measure manager/broker overhead rather than real compute throughput. CPU-heavy tasks should scale differently because the manager does less work per second relative to engine compute time.
+
+Scale-oriented defaults:
+
+- Worker supervisors own heartbeats; lease polling does not write heartbeat state per request.
+- Worker nodes use a bounded HTTP session pool, so many instances do not create unbounded sockets but also do not serialize every broker call.
+- Idle instances use jitter/backoff to avoid synchronized polling bursts.
+- SQLite runs in WAL mode with `synchronous=NORMAL` by default for better single-manager throughput.
+- Additional task/event indexes are created during startup/migration.
+- Job creation bulk-inserts task rows with `executemany`.
+
+Relevant tuning knobs:
+
+```bash
+TASKGRID_SQLITE_SYNCHRONOUS=NORMAL
+TASKGRID_LEASE_CANDIDATE_MULTIPLIER=50
+python -m taskgrid.worker --poll-seconds 0.5 --heartbeat-seconds 2 --broker-pool-size 8
+```
+
+See also:
+
+```text
+docs/SCALE.md
+```
+
+
+### Manager connection stress benchmark
+
+To stress the manager/broker directly, use the connection-focused benchmark. It simulates many worker nodes and instance polling loops over HTTP without launching real worker executors:
+
+```bash
+python scripts/benchmark_manager_connections.py \
+  --workers 4 \
+  --instances-per-worker 100 \
+  --clients 16 \
+  --tasks-per-client 100 \
+  --shared-session-per-worker
+```
+
+See `docs/SCALE.md` for current benchmark results and bottleneck notes.
+
+
+## Result exports
+
+TaskGrid keeps task rows as the source of truth and lets clients download completed output later, even after disconnecting.
+
+Useful endpoints:
+
+```text
+GET /jobs/{job_id}/results/export?format=json
+GET /jobs/{job_id}/results/export?format=csv
+GET /jobs/{job_id}/results/export?format=csv&failed_only=true
+GET /sessions/{session_id}/results/export?format=json
+GET /sessions/{session_id}/results/export?format=csv
+GET /sessions/{session_id}/results/export?format=csv&failed_only=true
+```
+
+The web UI exposes these from job/session result pages as **Download JSON**, **Download CSV**, and **Failed CSV**.
+
+## Retention and cleanup
+
+TaskGrid includes cautious retention cleanup for local manager state:
+
+```text
+GET  /maintenance/retention/preview
+POST /maintenance/retention/apply
+```
+
+The UI page is:
+
+```text
+/ui/manager/retention
+```
+
+Cleanup only removes terminal sessions/jobs/tasks older than the selected windows. Queued and running work is never removed. Manager events can be trimmed separately, and stale worker rows can be purged as part of cleanup.
+
+## Batch leasing and long polling
+
+The default worker path remains one single-task instance leasing one task at a time. For larger worker nodes, enable node-level batch leasing:
+
+```bash
+python -m taskgrid.worker \
+  --module examples.custom_tasks \
+  --instances 16 \
+  --batch-lease-size 8
+```
+
+Batch leasing reduces manager request pressure by letting a node lease work for multiple idle instances in one request. Each task is still assigned to a precise execution slot such as:
+
+```text
+node-a-instance-003
+```
+
+Optional long polling reduces empty idle polls:
+
+```bash
+python -m taskgrid.worker \
+  --module examples.custom_tasks \
+  --instances 16 \
+  --batch-lease-size 8 \
+  --long-poll-seconds 2
+```
+
+Keep `--batch-lease-size 1` to use the original per-instance lease path.

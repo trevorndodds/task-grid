@@ -112,9 +112,11 @@ def layout(title: str, body: str, *, refresh: bool = False) -> str:
         .pill {{ display:inline-block; padding:3px 9px; border-radius:999px; background:var(--soft); color:#344054; font-size:12px; font-weight:700; white-space:nowrap; }}
         .status-succeeded {{ background:var(--good); color:var(--good-text); }}
         .status-failed {{ background:var(--bad); color:var(--bad-text); }}
-        .status-running, .status-leasing {{ background:var(--warn); color:var(--warn-text); }}
+        .status-running, .status-leasing, .status-cancelling {{ background:var(--warn); color:var(--warn-text); }}
         .status-queued {{ background:var(--info); color:var(--info-text); }}
+        .status-paused {{ background:#fef0c7; color:#b54708; }}
         .status-cancelled, .status-stopped {{ background:#eaecf0; color:#344054; }}
+        .status-stale {{ background:#fee4e2; color:#b42318; }}
         .status-idle {{ background:#ecfdf3; color:#067647; }}
         .progress-wrap {{ height:8px; background:#eaecf0; border-radius:999px; overflow:hidden; min-width:120px; }}
         .progress-fill {{ height:100%; background:#475467; border-radius:999px; }}
@@ -157,11 +159,14 @@ def layout(title: str, body: str, *, refresh: bool = False) -> str:
           <nav class='nav'>
             <a href='/ui'>Dashboard</a>
             <a href='/ui/sessions'>Service Sessions</a>
+            <a href='/ui/client-sessions'>Client Resume</a>
             <a href='/ui/jobs'>Jobs</a>
             <a href='/ui/submit'>Submit Job</a>
             <a href='/ui/workers'>Workers</a>
             <a href='/ui/task-catalog'>Task Catalog</a>
             <a href='/ui/manager/data-flow'>Data Flow</a>
+            <a href='/ui/manager/recovery'>Recovery</a>
+            <a href='/ui/manager/retention'>Retention</a>
             <a href='/ui/manager/log'>Manager Log</a>
             <a href='/docs'>API Docs</a>
           </nav>
@@ -182,7 +187,7 @@ def job_table(jobs: list[dict[str, Any]]) -> str:
             <tr>
               <td><a href='/ui/jobs/{path_id(j['id'])}'><code>{short_id(j['id'])}</code></a></td>
               <td>{h(j['name'])}<div class='tiny'>{h(j['task_type'])}</div></td>
-              <td>{status_pill(j['status'])}</td>
+              <td>{status_pill(j['status'])}{' ' + status_pill('paused') if int(j.get('paused') or 0) else ''}</td>
               <td>{progress_bar(int(j['completed_tasks']), int(j['total_tasks']))}</td>
               <td>{h(j['failed_tasks'])}</td>
               <td>{h(j['priority'])}</td>
@@ -210,7 +215,7 @@ def session_table(sessions: list[dict[str, Any]]) -> str:
             <tr>
               <td><a href='/ui/sessions/{path_id(sess['id'])}'><code>{short_id(sess['id'])}</code></a></td>
               <td>{h(sess['name'])}<div class='tiny'>{h(sess.get('total_jobs', 0))} job(s)</div></td>
-              <td>{status_pill(sess['status'])}</td>
+              <td>{status_pill(sess['status'])}{' ' + status_pill('paused') if int(sess.get('paused') or 0) else ''}</td>
               <td>{h(sess.get('priority', 0))}</td>
               <td>{progress_bar(int(sess.get('completed_tasks') or 0), int(sess.get('total_tasks') or 0))}</td>
               <td>{h(sess.get('queued_tasks', 0))}</td>
@@ -388,13 +393,13 @@ def dashboard() -> str:
     body = f"""
     <div class='topline'>
       <div><h1>Dashboard</h1><div class='muted'>Auto-refreshes every 5 seconds · DB <code>{h(db_path())}</code></div></div>
-      <div class='actions'><a class='button' href='/ui/submit'>Submit Job</a><a class='button secondary' href='/docs'>API Docs</a></div>
+      <div class='actions'><a class='button' href='/ui/submit'>Submit Job</a><a class='button secondary' href='/ui/manager/recovery'>Recovery</a><a class='button secondary' href='/docs'>API Docs</a></div>
     </div>
     <div class='grid stats'>
       <div class='card stat'><div class='label'>Sessions</div><div class='value'>{h(stats['sessions_total'])}</div><div class='tiny'>queued {h(stats['sessions_queued'])} · running {h(stats['sessions_running'])}</div></div>
       <div class='card stat'><div class='label'>Tasks</div><div class='value'>{h(stats['tasks_total'])}</div><div class='tiny'>queued {h(stats['tasks_queued'])} · running {h(stats['tasks_running'])}</div></div>
       <div class='card stat'><div class='label'>Succeeded</div><div class='value'>{h(stats['tasks_succeeded'])}</div><div class='tiny'>failed {h(stats['tasks_failed'])} · cancelled {h(stats['tasks_cancelled'])}</div></div>
-      <div class='card stat'><div class='label'>Workers</div><div class='value'>{h(stats['workers_total'])}</div><div class='tiny'>busy instances {h(stats.get('worker_slots_active', 0))} · configured {h(stats.get('worker_slots_desired', 0))}</div></div>
+      <div class='card stat'><div class='label'>Workers</div><div class='value'>{h(stats['workers_total'])}</div><div class='tiny'>active {h(stats.get('workers_active', 0))} · stale {h(stats.get('workers_stale', 0))} · expired leases {h(stats.get('tasks_expired_leases', 0))}</div></div>
     </div>
     <div class='grid two' style='margin-top:16px'>
       <section class='card'><h2>Recent Service Sessions</h2>{session_table(sessions)}</section>
@@ -433,10 +438,10 @@ def session_detail(session_id: str) -> str:
     body = f"""
     <div class='topline'>
       <div><h1>{h(session['name'])}</h1><div class='muted'><code>{h(session['id'])}</code> · created {h(session.get('created_at'))}</div></div>
-      <div class='actions'><a class='button secondary' href='/ui/sessions'>Back to Sessions</a><a class='button secondary' href='/ui/sessions/{path_id(session_id)}/results'>Results</a><a class='button secondary' href='/sessions/{path_id(session_id)}/results'>Raw JSON</a></div>
+      <div class='actions'><a class='button secondary' href='/ui/sessions'>Back to Sessions</a><a class='button secondary' href='/ui/sessions/{path_id(session_id)}/results'>Results</a><a class='button secondary' href='/sessions/{path_id(session_id)}/results/export?format=json'>Download JSON</a><a class='button secondary' href='/sessions/{path_id(session_id)}/results/export?format=csv'>Download CSV</a><a class='button secondary' href='/sessions/{path_id(session_id)}/results'>Raw JSON</a>{'<form method="post" action="/ui/sessions/' + path_id(session_id) + '/resume"><button type="submit">Resume</button></form>' if int(session.get('paused') or 0) else '<form method="post" action="/ui/sessions/' + path_id(session_id) + '/pause"><button class="secondary" type="submit">Pause</button></form>'}</div>
     </div>
     <div class='grid stats'>
-      <div class='card stat'><div class='label'>Status</div><div class='value' style='font-size:20px'>{status_pill(session['status'])}</div></div>
+      <div class='card stat'><div class='label'>Status</div><div class='value' style='font-size:20px'>{status_pill(session['status'])}{' ' + status_pill('paused') if int(session.get('paused') or 0) else ''}</div><div class='tiny'>{h(session.get('pause_reason') or '')}</div></div>
       <div class='card stat'><div class='label'>Task Progress</div>{progress_bar(int(session.get('completed_tasks') or 0), int(session.get('total_tasks') or 0))}</div>
       <div class='card stat'><div class='label'>Pending / Running</div><div class='value'>{h(session.get('queued_tasks', 0))}/{h(session.get('running_tasks', 0))}</div></div>
       <div class='card stat'><div class='label'>Failed / Total Tasks</div><div class='value'>{h(session.get('failed_tasks', 0))}/{h(session.get('total_tasks', 0))}</div></div>
@@ -444,6 +449,7 @@ def session_detail(session_id: str) -> str:
     <div class='grid stats' style='margin-top:16px'>
       <div class='card stat'><div class='label'>Priority</div><div class='value'>{h(session.get('priority', 0))}</div></div>
       <div class='card stat'><div class='label'>Jobs</div><div class='value'>{h(session.get('total_jobs', 0))}</div></div>
+      <div class='card stat'><div class='label'>Client</div><div class='value' style='font-size:14px'><code>{h(session.get('client_id') or '—')}</code></div></div>
       <div class='card stat'><div class='label'>Created</div><div class='value' style='font-size:16px'>{h(session.get('created_at'))}</div></div>
       <div class='card stat'><div class='label'>Started</div><div class='value' style='font-size:16px'>{h(session.get('started_at') or '—')}</div></div>
       <div class='card stat'><div class='label'>Finished</div><div class='value' style='font-size:16px'>{h(session.get('finished_at') or '—')}</div></div>
@@ -457,6 +463,10 @@ def session_detail(session_id: str) -> str:
           <input name='priority' type='number' value='{h(session.get('priority', 0))}' style='max-width:140px'>
           <button type='submit'>Apply Priority</button>
         </form>
+        <h2 style='margin-top:18px'>Reconnect</h2>
+        <p class='muted'>A client can reattach with this client ID and resume token to list/download its sessions after disconnecting.</p>
+        <pre>client_id={h(session.get('client_id') or '')}
+resume_token={h(session.get('resume_token') or '')}</pre>
         <h2 style='margin-top:18px'>Session Metadata</h2><pre>{pretty_json(session.get('metadata', {}))}</pre><h2 style='margin-top:18px'>Session Events</h2>{event_table(events)}
       </section>
     </div>
@@ -477,6 +487,19 @@ async def session_priority_from_ui(session_id: str, request: Request) -> Redirec
     return RedirectResponse(url=f"/ui/sessions/{path_id(session_id)}", status_code=303)
 
 
+@router.post("/sessions/{session_id}/pause")
+async def session_pause_from_ui(session_id: str, request: Request) -> RedirectResponse:
+    form = await request.form()
+    core.set_session_paused(session_id, True, reason=str(form.get("reason") or "").strip() or None, updated_by="ui")
+    return RedirectResponse(url=f"/ui/sessions/{path_id(session_id)}", status_code=303)
+
+
+@router.post("/sessions/{session_id}/resume")
+def session_resume_from_ui(session_id: str) -> RedirectResponse:
+    core.set_session_paused(session_id, False, updated_by="ui")
+    return RedirectResponse(url=f"/ui/sessions/{path_id(session_id)}", status_code=303)
+
+
 @router.get("/sessions/{session_id}/results", response_class=HTMLResponse)
 def session_results_page(session_id: str) -> str:
     results = core.get_session_results(session_id)
@@ -485,7 +508,7 @@ def session_results_page(session_id: str) -> str:
     body = f"""
     <div class='topline'>
       <div><h1>Session Results</h1><div class='muted'><code>{h(results['session_id'])}</code> · {h(results['name'])}</div></div>
-      <div class='actions'><a class='button secondary' href='/ui/sessions/{path_id(session_id)}'>Back to Session</a><a class='button secondary' href='/sessions/{path_id(session_id)}/results'>Raw JSON</a></div>
+      <div class='actions'><a class='button secondary' href='/ui/sessions/{path_id(session_id)}'>Back to Session</a><a class='button secondary' href='/sessions/{path_id(session_id)}/results'>Raw JSON</a><a class='button secondary' href='/sessions/{path_id(session_id)}/results/export?format=json'>Download JSON</a><a class='button secondary' href='/sessions/{path_id(session_id)}/results/export?format=csv'>Download CSV</a><a class='button secondary' href='/sessions/{path_id(session_id)}/results/export?format=csv&failed_only=true'>Failed CSV</a></div>
     </div>
     <div class='grid stats'>
       <div class='card stat'><div class='label'>Status</div><div class='value' style='font-size:20px'>{status_pill(results['status'])}</div></div>
@@ -505,6 +528,39 @@ def session_results_page(session_id: str) -> str:
     </section>
     """
     return layout(f"Session results {session_id}", body, refresh=results["status"] in {"queued", "running"})
+
+@router.get("/client-sessions", response_class=HTMLResponse)
+def client_sessions_page(client_id: str | None = None, resume_token: str | None = None, status: str | None = None) -> str:
+    sessions: list[dict[str, Any]] = []
+    looked = bool(client_id and resume_token)
+    if looked:
+        sessions = core.list_client_sessions(client_id or "", resume_token or "", limit=200, status=status)
+    result_html = ""
+    if looked:
+        result_html = f"""
+        <section class='card' style='margin-top:16px'>
+          <h2>Resumable Sessions</h2>
+          {session_table(sessions)}
+        </section>
+        """
+    body = f"""
+    <div class='topline'>
+      <div><h1>Client Resume</h1><div class='muted'>List sessions for a reconnecting client using its client ID and resume token.</div></div>
+    </div>
+    <section class='card'>
+      <form class='stack' method='get' action='/ui/client-sessions'>
+        <div class='form-row'>
+          <label>Client ID<input name='client_id' value='{h(client_id or '')}' required></label>
+          <label>Resume token<input name='resume_token' value='{h(resume_token or '')}' required></label>
+          <label>Status filter<input name='status' placeholder='optional' value='{h(status or '')}'></label>
+        </div>
+        <div class='actions'><button type='submit'>Find Sessions</button></div>
+      </form>
+    </section>
+    {result_html}
+    """
+    return layout("Client Resume", body)
+
 
 @router.get("/jobs", response_class=HTMLResponse)
 def jobs_page(status: str | None = None) -> str:
@@ -531,14 +587,17 @@ def job_detail(job_id: str) -> str:
     tasks = core.list_tasks(job_id=job_id, limit=1000)
     events = core.list_events(entity_type="job", entity_id=job_id, limit=50)
     cancel_button = ""
-    if job["status"] not in {"succeeded", "failed", "cancelled"}:
+    if job["status"] not in {"succeeded", "failed", "cancelled", "cancelling"}:
         cancel_button = f"""
-        <form method='post' action='/ui/jobs/{path_id(job_id)}/cancel' onsubmit="return confirm('Cancel this job?');">
-          <button class='danger' type='submit'>Cancel Job</button>
+        <form method='post' action='/ui/jobs/{path_id(job_id)}/cancel?mode=graceful' onsubmit="return confirm('Request graceful cancellation? Queued tasks cancel now; running tasks finish.');">
+          <button class='danger' type='submit'>Graceful Cancel</button>
+        </form>
+        <form method='post' action='/ui/jobs/{path_id(job_id)}/cancel?mode=force' onsubmit="return confirm('Force cancel queued and running tasks?');">
+          <button class='secondary' type='submit'>Force Cancel</button>
         </form>
         """
     retry_button = ""
-    if int(job.get("failed_tasks") or 0) > 0 and job["status"] != "cancelled":
+    if int(job.get("failed_tasks") or 0) > 0 and job["status"] not in {"cancelled", "cancelling"}:
         retry_button = f"""
         <form method='post' action='/ui/jobs/{path_id(job_id)}/retry-failed'>
           <button type='submit'>Retry Failed</button>
@@ -547,10 +606,10 @@ def job_detail(job_id: str) -> str:
     body = f"""
     <div class='topline'>
       <div><h1>{h(job['name'])}</h1><div class='muted'><code>{h(job['id'])}</code> · {h(job['task_type'])} · session <a href='/ui/sessions/{path_id(job.get('session_id') or '')}'><code>{short_id(job.get('session_id') or '')}</code></a></div></div>
-      <div class='actions'><a class='button secondary' href='/ui/jobs'>Back</a><a class='button secondary' href='/ui/jobs/{path_id(job_id)}/results'>Results</a><a class='button secondary' href='/jobs/{path_id(job_id)}/results'>Raw JSON</a>{retry_button}{cancel_button}</div>
+      <div class='actions'><a class='button secondary' href='/ui/jobs'>Back</a><a class='button secondary' href='/ui/jobs/{path_id(job_id)}/results'>Results</a><a class='button secondary' href='/jobs/{path_id(job_id)}/results'>Raw JSON</a><a class='button secondary' href='/jobs/{path_id(job_id)}/results/export?format=json'>Download JSON</a><a class='button secondary' href='/jobs/{path_id(job_id)}/results/export?format=csv'>Download CSV</a>{'<form method="post" action="/ui/jobs/' + path_id(job_id) + '/resume"><button type="submit">Resume</button></form>' if int(job.get('paused') or 0) and job['status'] not in {'succeeded','failed','cancelled'} else '<form method="post" action="/ui/jobs/' + path_id(job_id) + '/pause"><button class="secondary" type="submit">Pause</button></form>' if job['status'] not in {'succeeded','failed','cancelled','cancelling'} else ''}{retry_button}{cancel_button}</div>
     </div>
     <div class='grid stats'>
-      <div class='card stat'><div class='label'>Status</div><div class='value' style='font-size:20px'>{status_pill(job['status'])}</div></div>
+      <div class='card stat'><div class='label'>Status</div><div class='value' style='font-size:20px'>{status_pill(job['status'])}{' ' + status_pill('paused') if int(job.get('paused') or 0) else ''}</div><div class='tiny'>{h(job.get('pause_reason') or '')}</div></div>
       <div class='card stat'><div class='label'>Progress</div>{progress_bar(int(job['completed_tasks']), int(job['total_tasks']))}</div>
       <div class='card stat'><div class='label'>Failed</div><div class='value'>{h(job['failed_tasks'])}</div></div>
       <div class='card stat'><div class='label'>Priority</div><div class='value'>{h(job['priority'])}</div></div>
@@ -560,7 +619,7 @@ def job_detail(job_id: str) -> str:
       <section class='card'><h2>Job Metadata</h2><pre>{pretty_json(job.get('metadata', {}))}</pre><h2 style='margin-top:18px'>Job Events</h2>{event_table(events)}</section>
     </div>
     """
-    return layout(f"Job {job_id}", body, refresh=job["status"] in {"queued", "running"})
+    return layout(f"Job {job_id}", body, refresh=job["status"] in {"queued", "running", "cancelling"})
 
 
 
@@ -573,7 +632,7 @@ def job_results_page(job_id: str) -> str:
     body = f"""
     <div class='topline'>
       <div><h1>Job Results</h1><div class='muted'><code>{h(results['job_id'])}</code> · {h(results['name'])} · session <a href='/ui/sessions/{path_id(results.get('session_id') or '')}'><code>{short_id(results.get('session_id') or '')}</code></a></div></div>
-      <div class='actions'><a class='button secondary' href='/ui/jobs/{path_id(job_id)}'>Back to Job</a><a class='button secondary' href='/jobs/{path_id(job_id)}/results'>Raw JSON</a></div>
+      <div class='actions'><a class='button secondary' href='/ui/jobs/{path_id(job_id)}'>Back to Job</a><a class='button secondary' href='/jobs/{path_id(job_id)}/results'>Raw JSON</a><a class='button secondary' href='/jobs/{path_id(job_id)}/results/export?format=json'>Download JSON</a><a class='button secondary' href='/jobs/{path_id(job_id)}/results/export?format=csv'>Download CSV</a><a class='button secondary' href='/jobs/{path_id(job_id)}/results/export?format=csv&failed_only=true'>Failed CSV</a></div>
     </div>
     <div class='grid stats'>
       <div class='card stat'><div class='label'>Status</div><div class='value' style='font-size:20px'>{status_pill(results['status'])}</div></div>
@@ -587,11 +646,24 @@ def job_results_page(job_id: str) -> str:
       {result_table(results.get('tasks', []))}
     </section>
     """
-    return layout(f"Job results {job_id}", body, refresh=results["status"] in {"queued", "running"})
+    return layout(f"Job results {job_id}", body, refresh=results["status"] in {"queued", "running", "cancelling"})
 
 @router.post("/jobs/{job_id}/cancel")
-def cancel_job_from_ui(job_id: str) -> RedirectResponse:
-    core.cancel_job(job_id)
+def cancel_job_from_ui(job_id: str, mode: str = "graceful") -> RedirectResponse:
+    core.cancel_job(job_id, mode=mode)
+    return RedirectResponse(url=f"/ui/jobs/{path_id(job_id)}", status_code=303)
+
+
+@router.post("/jobs/{job_id}/pause")
+async def pause_job_from_ui(job_id: str, request: Request) -> RedirectResponse:
+    form = await request.form()
+    core.set_job_paused(job_id, True, reason=str(form.get("reason") or "").strip() or None, updated_by="ui")
+    return RedirectResponse(url=f"/ui/jobs/{path_id(job_id)}", status_code=303)
+
+
+@router.post("/jobs/{job_id}/resume")
+def resume_job_from_ui(job_id: str) -> RedirectResponse:
+    core.set_job_paused(job_id, False, updated_by="ui")
     return RedirectResponse(url=f"/ui/jobs/{path_id(job_id)}", status_code=303)
 
 
@@ -714,14 +786,22 @@ def task_catalog_page(task_type: str | None = None, required_tags: str | None = 
 def workers_page() -> str:
     workers = core.list_workers(limit=250)
     if not workers:
-        rows = empty_row(12, "No workers have checked in yet. Start one with: python -m taskgrid.worker --module examples.custom_tasks --instances 4")
+        rows = empty_row(14, "No workers have checked in yet. Start one with: python -m taskgrid.worker --module examples.custom_tasks --instances 4")
     else:
-        rows = "".join(
-            f"""
+        row_parts = []
+        for w in workers:
+            disabled = bool(w.get("disabled"))
+            effective_status = "disabled" if disabled else (w["status"] if w.get("active") else "stale")
+            state_action = "enable" if disabled else "disable"
+            state_label = "Enable" if disabled else "Disable"
+            state_class = "secondary" if disabled else "danger"
+            reason_text = f"<div class='tiny'>reason: {h(w.get('disabled_reason'))}</div>" if disabled and w.get("disabled_reason") else ""
+            row_parts.append(f"""
             <tr>
+              <td><input form='bulk-worker-state' type='checkbox' name='worker_ids' value='{h(w['id'])}'></td>
               <td><code>{h(w['id'])}</code></td>
               <td>{h(w['hostname'])}</td>
-              <td>{status_pill(w['status'])}</td>
+              <td>{status_pill(effective_status)}<div class='tiny'>active {h(w.get('active'))}</div>{reason_text}</td>
               <td>{''.join(f"<span class='pill'>{h(t)}</span> " for t in (w.get('task_types') or (w.get('metadata') or {}).get('task_types') or [])) or '<span class="tiny">none advertised</span>'}</td>
               <td>{h(w.get('running_tasks', 0))}/{h(w.get('active_concurrency', w.get('desired_concurrency', 1)))}</td>
               <td>{h(w.get('desired_concurrency', 1))}</td>
@@ -737,17 +817,37 @@ def workers_page() -> str:
                 </form>
                 <details style='margin-top:8px'><summary class='tiny'>metadata</summary><pre style='margin:8px 0 0; max-height:120px'>{pretty_json(w.get('metadata', {}))}</pre></details>
               </td>
+              <td>
+                <form class='inline-form' method='post' action='/ui/workers/{path_id(w['id'])}/{state_action}' onsubmit="return confirm('{state_label} worker {h(w['id'])}?');">
+                  <input name='reason' placeholder='reason' style='width:120px'>
+                  <button class='{state_class}' type='submit'>{state_label}</button>
+                </form>
+              </td>
             </tr>
-            """
-            for w in workers
-        )
+            """)
+        rows = "".join(row_parts)
+    stale_count = sum(1 for worker in workers if not worker.get('active'))
+    disabled_count = sum(1 for worker in workers if worker.get('disabled'))
+    purge_disabled = "disabled" if stale_count == 0 else ""
     body = f"""
     <div class='topline'>
-      <div><h1>Workers</h1><div class='muted'>Worker nodes poll the broker, run single-task instances, heartbeat while running, and resize the number of instances from this page.</div></div>
+      <div><h1>Workers</h1><div class='muted'>Worker nodes poll the broker, run single-task instances, heartbeat while running, and resize or disable nodes from this page.</div></div>
+      <div class='actions'>
+        <form class='inline-form' method='post' action='/ui/workers/purge-offline' onsubmit="return confirm('Purge stale/offline worker records from the manager registry? Running task assignments are skipped.');">
+          <button class='secondary' type='submit' {purge_disabled}>Purge Offline Workers ({h(stale_count)})</button>
+        </form>
+      </div>
     </div>
     <section class='card'>
-      <p class='muted'>Changing desired instances does not kill running tasks. Each instance leases one task, runs it, returns the result, then picks up the next pending task. Upscaling starts new instances quickly; downscaling lets extra instances finish their current task before stopping.</p>
-      <table><thead><tr><th>ID</th><th>Host</th><th>Status</th><th>Task Types</th><th>Busy</th><th>Instances</th><th>Pending</th><th>Task</th><th>Version</th><th>Logs</th><th>Heartbeat</th><th>Config</th></tr></thead><tbody>{rows}</tbody></table>
+      <p class='muted'>Changing desired instances does not kill running tasks. Disabling a worker is graceful: running tasks may finish, but the manager will not lease new tasks to that node. Heartbeating disabled nodes scale their local instance loops down to zero until re-enabled.</p>
+      <p class='muted'>Offline workers persist in the manager registry for visibility. Purging removes stale worker/config rows only; manager events, task history, results, and remote worker logs are kept.</p>
+      <form id='bulk-worker-state' class='inline-form' method='post' action='/ui/workers/bulk-state' onsubmit="return confirm('Apply this state change to selected workers?');" style='margin:0 0 12px'>
+        <input name='reason' placeholder='optional reason for selected workers' style='min-width:260px'>
+        <button class='danger' type='submit' name='action' value='disable'>Disable Selected</button>
+        <button class='secondary' type='submit' name='action' value='enable'>Enable Selected</button>
+        <span class='tiny'>Disabled workers: {h(disabled_count)}</span>
+      </form>
+      <table><thead><tr><th></th><th>ID</th><th>Host</th><th>Status</th><th>Task Types</th><th>Busy</th><th>Instances</th><th>Pending</th><th>Task</th><th>Version</th><th>Logs</th><th>Heartbeat</th><th>Config</th><th>State</th></tr></thead><tbody>{rows}</tbody></table>
     </section>
     """
     return layout("Workers", body, refresh=True)
@@ -830,6 +930,36 @@ async def worker_config_from_ui(worker_id: str, request: Request) -> RedirectRes
     return RedirectResponse(url="/ui/workers", status_code=303)
 
 
+@router.post("/workers/{worker_id}/disable")
+async def worker_disable_from_ui(worker_id: str, request: Request) -> RedirectResponse:
+    form = await request.form()
+    core.set_worker_enabled(worker_id, enabled=False, reason=str(form.get("reason") or ""), updated_by="ui")
+    return RedirectResponse(url="/ui/workers", status_code=303)
+
+
+@router.post("/workers/{worker_id}/enable")
+async def worker_enable_from_ui(worker_id: str, request: Request) -> RedirectResponse:
+    form = await request.form()
+    core.set_worker_enabled(worker_id, enabled=True, reason=str(form.get("reason") or ""), updated_by="ui")
+    return RedirectResponse(url="/ui/workers", status_code=303)
+
+
+@router.post("/workers/bulk-state")
+async def worker_bulk_state_from_ui(request: Request) -> RedirectResponse:
+    form = await request.form()
+    worker_ids = [str(value) for value in form.getlist("worker_ids") if str(value).strip()]
+    action = str(form.get("action") or "disable").lower()
+    if worker_ids:
+        core.set_workers_enabled(worker_ids, enabled=(action == "enable"), reason=str(form.get("reason") or ""), updated_by="ui")
+    return RedirectResponse(url="/ui/workers", status_code=303)
+
+
+
+@router.post("/workers/purge-offline")
+def purge_offline_workers_from_ui() -> RedirectResponse:
+    core.purge_offline_workers(updated_by="ui")
+    return RedirectResponse(url="/ui/workers", status_code=303)
+
 
 
 @router.get("/manager/data-flow", response_class=HTMLResponse)
@@ -848,15 +978,16 @@ def manager_data_flow_page() -> str:
         <tbody>
           <tr><td>1</td><td>Client</td><td><code>POST /jobs</code></td><td>Job name, task type, JSON task payload array, priority/retries/metadata.</td><td><code>JobSubmitted</code></td></tr>
           <tr><td>2</td><td>Broker</td><td>SQLite state</td><td>Creates one service session, one job, and one queued task row per payload.</td><td><code>ServiceSessionCreated</code></td></tr>
-          <tr><td>3</td><td>Worker instance</td><td><code>POST /tasks/lease</code></td><td>Leases exactly one queued task and receives its <code>payload</code> JSON.</td><td><code>TaskAccepted</code></td></tr>
+          <tr><td>3</td><td>Worker instance</td><td><code>POST /tasks/lease</code></td><td>Leases exactly one queued task and receives its <code>payload</code> JSON.</td><td><code>TaskAccepted</code> <span class='tiny'>(debug)</span></td></tr>
           <tr><td>4</td><td>Engine</td><td>Local Python registry</td><td>Runs <code>run_task(task_type, payload)</code> inside a one-task process slot.</td><td>worker instance log</td></tr>
-          <tr><td>5</td><td>Worker instance</td><td><code>POST /tasks/&lt;id&gt;/complete</code></td><td>Returns JSON-serializable result to the broker.</td><td><code>TaskCompleted</code></td></tr>
+          <tr><td>5</td><td>Worker instance</td><td><code>POST /tasks/&lt;id&gt;/complete</code></td><td>Returns JSON-serializable result to the broker.</td><td><code>TaskCompleted</code> <span class='tiny'>(debug)</span></td></tr>
           <tr><td>6</td><td>Client/UI</td><td><code>GET /jobs/&lt;id&gt;/results</code> or <code>GET /sessions/&lt;id&gt;/results</code></td><td>Reads all task results/errors with payload/result sizes and timing.</td><td>read-only</td></tr>
         </tbody>
       </table>
     </section>
     <section class='card' style='margin-top:16px'>
       <h2>Recent Task Flow Events</h2>
+      <p class='muted'>Normal mode keeps task state on task rows and suppresses high-volume successful accept/complete events. Set <code>TASKGRID_EVENT_MODE=debug</code> or <code>TASKGRID_VERBOSE_TASK_EVENTS=1</code> to record every successful task lifecycle event here.</p>
       {event_table(task_events)}
     </section>
     <section class='card' style='margin-top:16px'>
@@ -865,6 +996,152 @@ def manager_data_flow_page() -> str:
     </section>
     """
     return layout("Data Flow", body, refresh=True)
+
+@router.get("/manager/recovery", response_class=HTMLResponse)
+def manager_recovery_page() -> str:
+    status = core.recovery_status()
+    stale_workers = status.get("stale_workers", [])
+    expired_tasks = status.get("expired_tasks", [])
+    worker_rows = "".join(
+        f"""
+        <tr>
+          <td><code>{h(worker.get('id'))}</code></td>
+          <td>{h(worker.get('hostname'))}</td>
+          <td>{status_pill(worker.get('status') if worker.get('active') else 'stale')}</td>
+          <td>{h(worker.get('last_heartbeat_at'))}</td>
+          <td>{''.join(f"<span class='pill'>{h(tag)}</span> " for tag in worker.get('tags', [])) or '<span class="tiny">none</span>'}</td>
+        </tr>
+        """
+        for worker in stale_workers
+    ) or empty_row(5, "No stale workers detected.")
+    task_rows = "".join(
+        f"""
+        <tr>
+          <td><a href='/ui/tasks/{path_id(task.get('id'))}'><code>{short_id(task.get('id'))}</code></a></td>
+          <td><a href='/ui/jobs/{path_id(task.get('job_id'))}'><code>{short_id(task.get('job_id'))}</code></a></td>
+          <td><code>{h(task.get('assigned_worker_id'))}</code></td>
+          <td>{h(task.get('attempts'))}/{1 + int(task.get('max_retries') or 0)}</td>
+          <td class='nowrap'>{h(task.get('lease_expires_at'))}</td>
+        </tr>
+        """
+        for task in expired_tasks
+    ) or empty_row(5, "No expired running task leases detected.")
+    body = f"""
+    <div class='topline'>
+      <div><h1>Recovery</h1><div class='muted'>Manager-side health checks for stale workers, expired task leases, and ignored late results.</div></div>
+      <div class='actions'><a class='button secondary' href='/maintenance/status'>Raw Status</a><a class='button secondary' href='/ui/manager/log'>Manager Log</a></div>
+    </div>
+    <div class='grid stats'>
+      <div class='card stat'><div class='label'>Workers</div><div class='value'>{h(status.get('workers_total', 0))}</div><div class='tiny'>active {h(status.get('workers_active', 0))} · stale {h(status.get('workers_stale', 0))}</div></div>
+      <div class='card stat'><div class='label'>Running Tasks</div><div class='value'>{h(status.get('running_tasks', 0))}</div><div class='tiny'>currently leased</div></div>
+      <div class='card stat'><div class='label'>Expired Leases</div><div class='value'>{h(status.get('expired_running_tasks', 0))}</div><div class='tiny'>eligible for recovery</div></div>
+      <div class='card stat'><div class='label'>Historical Recoveries</div><div class='value'>{h(status.get('lease_requeue_events', 0))}</div><div class='tiny'>failed by lease {h(status.get('lease_failed_events', 0))}</div></div>
+    </div>
+    <section class='card' style='margin-top:16px'>
+      <h2>Recover Expired Leases</h2>
+      <p class='muted'>This requeues expired running tasks that still have retry attempts left, or fails them when retries are exhausted. Running tasks with valid leases are not touched.</p>
+      <form method='post' action='/ui/manager/recovery/run'><button type='submit'>Recover Expired Leases</button></form>
+    </section>
+    <section class='card' style='margin-top:16px'>
+      <h2>Purge Offline Workers</h2>
+      <p class='muted'>Removes stale/offline worker rows and their config rows from the manager registry. Workers with running task assignments are skipped; run lease recovery first if needed.</p>
+      <form method='post' action='/ui/manager/recovery/purge-offline-workers' onsubmit="return confirm('Purge offline worker records from the manager registry?');"><button class='secondary' type='submit'>Purge Offline Workers</button></form>
+    </section>
+    <div class='grid two' style='margin-top:16px'>
+      <section class='card'><h2>Expired Running Tasks</h2><table><thead><tr><th>Task</th><th>Job</th><th>Worker Instance</th><th>Attempts</th><th>Lease Expires</th></tr></thead><tbody>{task_rows}</tbody></table></section>
+      <section class='card'><h2>Stale Workers</h2><table><thead><tr><th>ID</th><th>Host</th><th>Status</th><th>Last Heartbeat</th><th>Tags</th></tr></thead><tbody>{worker_rows}</tbody></table></section>
+    </div>
+    <section class='card' style='margin-top:16px'>
+      <h2>Recovery Events</h2>
+      {event_table(core.list_events(code='MaintenanceRecoveryRun', limit=20) + core.list_events(code='TaskLeaseExpiredRequeued', limit=20) + core.list_events(code='TaskLeaseExpiredFailed', limit=20) + core.list_events(code='TaskResultIgnored', limit=20) + core.list_events(code='WorkerPurgeOfflineRun', limit=20) + core.list_events(code='WorkerPurgedOffline', limit=20))}
+    </section>
+    """
+    return layout("Recovery", body, refresh=True)
+
+
+@router.post("/manager/recovery/run")
+def run_recovery_from_ui() -> RedirectResponse:
+    core.recover_expired_leases(updated_by="ui")
+    return RedirectResponse(url="/ui/manager/recovery", status_code=303)
+
+
+@router.post("/manager/recovery/purge-offline-workers")
+def purge_offline_workers_from_recovery_ui() -> RedirectResponse:
+    core.purge_offline_workers(updated_by="ui")
+    return RedirectResponse(url="/ui/manager/recovery", status_code=303)
+
+
+@router.get("/manager/retention", response_class=HTMLResponse)
+def manager_retention_page(completed_days: int = 30, failed_days: int = 90, event_days: int = 30, purge_workers_active_seconds: int | None = None) -> str:
+    preview = core.retention_preview(
+        completed_days=completed_days,
+        failed_days=failed_days,
+        event_days=event_days,
+        purge_workers_active_seconds=purge_workers_active_seconds,
+    )
+    body = f"""
+    <div class='topline'>
+      <div><h1>Retention</h1><div class='muted'>Preview and apply cleanup for old terminal sessions, old manager events, and stale worker rows.</div></div>
+      <div class='actions'><a class='button secondary' href='/ui/manager/recovery'>Recovery</a><a class='button secondary' href='/ui/manager/log'>Manager Log</a></div>
+    </div>
+    <section class='card'>
+      <h2>Cleanup Preview</h2>
+      <form class='form-row' method='get' action='/ui/manager/retention'>
+        <label>Completed/cancelled session days<input type='number' min='0' max='3650' name='completed_days' value='{h(completed_days)}'></label>
+        <label>Failed session days<input type='number' min='0' max='3650' name='failed_days' value='{h(failed_days)}'></label>
+        <label>Event days<input type='number' min='0' max='3650' name='event_days' value='{h(event_days)}'></label>
+        <label>Stale worker seconds<input type='number' min='1' max='86400' name='purge_workers_active_seconds' value='{h(purge_workers_active_seconds or "")}' placeholder='optional'></label>
+        <label>&nbsp;<button type='submit'>Preview</button></label>
+      </form>
+      <div class='grid stats' style='margin-top:16px'>
+        <div class='card stat'><div class='label'>Completed/cancelled sessions</div><div class='value'>{h(preview.get('completed_or_cancelled_sessions'))}</div></div>
+        <div class='card stat'><div class='label'>Failed sessions</div><div class='value'>{h(preview.get('failed_sessions'))}</div></div>
+        <div class='card stat'><div class='label'>Old events</div><div class='value'>{h(preview.get('old_events'))}</div></div>
+        <div class='card stat'><div class='label'>Stale workers</div><div class='value'>{h(preview.get('stale_workers'))}</div></div>
+      </div>
+      <pre>{pretty_json(preview)}</pre>
+      <form method='post' action='/ui/manager/retention/apply' class='actions'>
+        <input type='hidden' name='completed_days' value='{h(completed_days)}'>
+        <input type='hidden' name='failed_days' value='{h(failed_days)}'>
+        <input type='hidden' name='event_days' value='{h(event_days)}'>
+        <input type='hidden' name='purge_workers_active_seconds' value='{h(purge_workers_active_seconds or "") }'>
+        <button class='danger' type='submit'>Apply Cleanup</button>
+        <span class='tiny'>Deletes only terminal sessions/jobs/tasks older than the selected windows. Running/queued work is never removed.</span>
+      </form>
+    </section>
+    """
+    return layout("Retention", body)
+
+
+@router.post("/manager/retention/apply")
+async def apply_retention_from_ui(request: Request) -> RedirectResponse:
+    form = await request.form()
+
+    def int_or_none(name: str) -> int | None:
+        raw = str(form.get(name) or "").strip()
+        if not raw:
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            return None
+
+    completed_days = int_or_none("completed_days") or 30
+    failed_days = int_or_none("failed_days") or 90
+    event_days = int_or_none("event_days") or 30
+    purge_workers_active_seconds = int_or_none("purge_workers_active_seconds")
+    core.apply_retention_cleanup(
+        completed_days=completed_days,
+        failed_days=failed_days,
+        event_days=event_days,
+        purge_workers_active_seconds=purge_workers_active_seconds,
+        updated_by="ui",
+    )
+    query = f"completed_days={completed_days}&failed_days={failed_days}&event_days={event_days}"
+    if purge_workers_active_seconds is not None:
+        query += f"&purge_workers_active_seconds={purge_workers_active_seconds}"
+    return RedirectResponse(url=f"/ui/manager/retention?{query}", status_code=303)
+
 
 @router.get("/manager/log", response_class=HTMLResponse)
 def manager_log_page(tail: int = core.MAX_MANAGER_LOG_TAIL_BYTES, view: str = "table") -> str:
@@ -884,7 +1161,7 @@ def manager_log_page(tail: int = core.MAX_MANAGER_LOG_TAIL_BYTES, view: str = "t
       </div>
     </div>
     <section class='card'>
-      <p class='muted'>Shows manager-side lifecycle events such as <code>TaskAccepted</code>, <code>TaskCompleted</code>, <code>TaskFailed</code>, and <code>JobSubmitted</code>.</p>
+      <p class='muted'>Shows manager-side operational events. Normal mode records submissions, warnings, failures, recovery, and admin actions; high-volume successful <code>TaskAccepted</code>/<code>TaskCompleted</code> events are debug-only via <code>TASKGRID_EVENT_MODE=debug</code> or <code>TASKGRID_VERBOSE_TASK_EVENTS=1</code>.</p>
       {log_body}
     </section>
     """
@@ -913,7 +1190,11 @@ def submit_page(error: str | None = None) -> str:
           <label>Session priority<input name='session_priority' type='number' value='0'></label>
           <label>Existing session ID <input name='session_id' placeholder='optional: attach this job to an existing session'></label>
         </div>
-        <label>Required worker tags <input name='required_tags' placeholder='optional, comma-separated: gpu, risk-model-v2'></label>
+        <div class='form-row'>
+          <label>Client ID<input name='client_id' placeholder='optional, generated if blank'></label>
+          <label>Resume token<input name='resume_token' placeholder='optional, required to attach securely'></label>
+          <label>Required worker tags <input name='required_tags' placeholder='gpu, risk'></label>
+        </div>
         <label><span><input name='require_capable_worker' type='checkbox' value='1' style='width:auto; margin-right:8px'>Reject if no active capable worker is online</span></label>
         <label>Tasks JSON array<textarea name='tasks_json' required>{h(sample)}</textarea></label>
         <label>Metadata JSON object<textarea name='metadata_json' style='min-height:90px'>{{}}</textarea></label>
@@ -944,6 +1225,8 @@ async def submit_from_ui(request: Request):
         metadata = json.loads(str(form.get("metadata_json") or "{}"))
         session_id = str(form.get("session_id") or "").strip() or None
         session_name = str(form.get("session_name") or "").strip() or None
+        client_id = str(form.get("client_id") or "").strip() or None
+        resume_token = str(form.get("resume_token") or "").strip() or None
         required_tags = [tag.strip().lower() for tag in str(form.get("required_tags") or "").split(",") if tag.strip()]
         require_capable_worker = str(form.get("require_capable_worker") or "").lower() in {"1", "true", "on", "yes"}
         if required_tags:
@@ -975,6 +1258,8 @@ async def submit_from_ui(request: Request):
             session_name=session_name,
             session_priority=session_priority,
             require_capable_worker=require_capable_worker,
+            client_id=client_id,
+            resume_token=resume_token,
         )
     except core.CapabilityError as exc:
         return submit_page(error=f"{exc}: {json.dumps(exc.details.get('warnings', []), ensure_ascii=False)}")

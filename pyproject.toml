@@ -1,6 +1,6 @@
 [project]
 name = "taskgrid"
-version = "0.10.1"
+version = "0.21.0"
 description = "TaskGrid: a lightweight distributed task manager"
 requires-python = ">=3.10"
 dependencies = [

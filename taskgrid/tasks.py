@@ -39,7 +39,7 @@ def sleep_task(payload: dict[str, Any]) -> dict[str, Any]:
 
 def load_modules(modules: list[str] | None = None) -> None:
     raw = modules or []
-    env_text = os.environ.get("TASKGRID_TASK_MODULES") or os.environ.get("GRIDLITE_TASK_MODULES") or ""
+    env_text = os.environ.get("TASKGRID_TASK_MODULES") or ""
     env_modules = [m.strip() for m in env_text.split(",") if m.strip()]
     for module_name in [*env_modules, *raw]:
         importlib.import_module(module_name)

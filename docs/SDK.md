@@ -26,10 +26,15 @@ python -m taskgrid.worker --module examples.custom_tasks --worker-id node-a --in
 ## Client constructor
 
 ```python
-TaskGridClient(base_url="http://127.0.0.1:8000")
+TaskGridClient(
+    base_url="http://127.0.0.1:8000",
+    client_id=None,
+    resume_token=None,
+    api_token=None,
+)
 ```
 
-`base_url` should point at the manager/broker.
+`base_url` should point at the manager/broker. `client_id` and `resume_token` are optional reconnect credentials. `api_token` is sent as `X-TaskGrid-Token` when the manager has client/admin auth enabled. The SDK stores generated reconnect credentials after the first submit response.
 
 ## Submitting work
 
@@ -58,8 +63,11 @@ Parameters:
 | `session_id` | `str | None` | Attach to an existing session. |
 | `session_name` | `str | None` | Name for a new session. |
 | `session_metadata` | `dict | None` | Metadata for a new session. |
+| `client_id` | `str | None` | Override the client's owner id for this submission. |
+| `resume_token` | `str | None` | Resume token for securely attaching to an existing owned session. |
+| `require_capable_worker` | `bool` | Reject early when no capable worker is online. |
 
-Return value is the created job object, including `id` and `session_id`.
+Return value is the created job object, including `id`, `session_id`, `client_id`, and `resume_token`.
 
 ### Submit with worker tags
 
@@ -128,7 +136,15 @@ results = client.results(job_id)
 Cancel a job:
 
 ```python
-client.cancel(job_id)
+client.cancel(job_id)                 # graceful: queued tasks cancel, running tasks finish
+client.cancel(job_id, mode="force")   # immediate/force cancel
+```
+
+Pause or resume a job without cancelling running tasks:
+
+```python
+client.pause_job(job_id, reason="hold for review")
+client.resume_job(job_id)
 ```
 
 Retry failed tasks in a job:
@@ -143,9 +159,45 @@ Retry a single task:
 client.retry_task(task_id, reset_attempts=True)
 ```
 
+## Client reconnect / resume
+
+After the first submission, keep the returned reconnect credentials:
+
+```python
+job = client.submit(
+    name="Risk Run",
+    task_type="square",
+    tasks=[{"x": 1}],
+    session_name="Morning Run",
+)
+
+client_id = job["client_id"]
+resume_token = job["resume_token"]
+```
+
+Later, from a new process:
+
+```python
+client = TaskGridClient(
+    "http://127.0.0.1:8000",
+    client_id=client_id,
+    resume_token=resume_token,
+)
+
+sessions = client.my_sessions()
+resumed = client.resume_session(job["session_id"])
+results = client.session_results(job["session_id"])
+```
+
+Or attach credentials after constructing the client:
+
+```python
+client.attach(client_id, resume_token)
+```
+
 ## Service sessions
 
-List sessions:
+List all sessions:
 
 ```python
 sessions = client.sessions()
@@ -168,6 +220,16 @@ Set session priority:
 ```python
 client.set_session_priority(session_id, 20)
 ```
+
+Pause/resume a session:
+
+```python
+client.pause_session(session_id, reason="maintenance")
+client.resume_session(session_id)
+client.set_sessions_paused([session_id], paused=True, reason="bulk hold")
+```
+
+Pause holds queued work without cancelling running tasks. Resuming a session does not override jobs that were individually paused.
 
 Behavior:
 
@@ -198,6 +260,18 @@ Set desired worker instances:
 client.set_worker_instances("node-a", 5)
 ```
 
+Disable or re-enable workers:
+
+```python
+client.disable_worker("node-a", reason="maintenance")
+client.enable_worker("node-a")
+
+client.disable_workers(["node-a", "node-b"], reason="maintenance window")
+client.enable_workers(["node-a", "node-b"])
+```
+
+Disabled workers do not receive new leases. Running tasks are allowed to finish, and the manager keeps task history/results/log references.
+
 Backwards-compatible alias:
 
 ```python
@@ -205,6 +279,33 @@ client.set_worker_concurrency("node-a", 5)
 ```
 
 The value now means desired single-task instances, not multi-task execution inside one instance.
+
+## Maintenance and recovery
+
+Check manager-side recovery state:
+
+```python
+status = client.recovery_status()
+print(status["workers_stale"], status["expired_running_tasks"])
+```
+
+Recover expired task leases:
+
+```python
+summary = client.recover_expired_leases()
+print(summary["requeued"], summary["failed"])
+```
+
+This only touches running tasks whose leases have already expired. Late results from old workers are ignored and logged by the manager.
+
+Purge stale/offline worker registry rows:
+
+```python
+summary = client.purge_offline_workers(active_seconds=60)
+print(summary["purged_count"], summary["skipped_count"])
+```
+
+By default, workers with running task assignments are skipped so you can recover expired leases first. Pass `include_running=True` only when you intentionally want to remove the stale worker record while preserving task history.
 
 ## Worker logs
 
@@ -271,8 +372,17 @@ client.workers()
 client.worker_config(worker_id)
 client.set_worker_instances(worker_id, desired_instances)
 client.set_worker_concurrency(worker_id, desired_concurrency)  # alias
+client.disable_worker(worker_id, reason=None)
+client.enable_worker(worker_id, reason=None)
+client.disable_workers(worker_ids, reason=None)
+client.enable_workers(worker_ids, reason=None)
+client.set_workers_disabled(worker_ids, disabled, reason=None)
 client.worker_logs(worker_id)
 client.worker_log(worker_id, filename, tail_bytes=1_000_000)
+client.purge_offline_workers(active_seconds=None, include_running=False)
+
+client.recovery_status()
+client.recover_expired_leases()
 
 client.wait(job_id, poll_seconds=1.0, timeout_seconds=None)
 ```
@@ -282,3 +392,29 @@ client.wait(job_id, poll_seconds=1.0, timeout_seconds=None)
 - The SDK currently uses Python standard-library `urllib` and raises underlying HTTP/URL exceptions.
 - It does not yet expose typed response classes.
 - It does not yet include authentication headers because authentication has not been added to the manager.
+
+## Export helpers
+
+```python
+client.export_results(job_id, format="json")
+client.export_results(job_id, format="csv")
+client.export_results(job_id, format="csv", failed_only=True)
+
+client.export_session_results(session_id, format="json")
+client.export_session_results(session_id, format="csv")
+```
+
+These return `bytes`, so callers can write them to a file:
+
+```python
+Path("results.csv").write_bytes(client.export_session_results(session_id, format="csv"))
+```
+
+## Retention helpers
+
+```python
+preview = client.retention_preview(completed_days=30, failed_days=90, event_days=30)
+summary = client.apply_retention_cleanup(completed_days=30, failed_days=90, event_days=30)
+```
+
+Cleanup only removes terminal sessions/jobs/tasks older than the selected windows. Running and queued work is preserved.

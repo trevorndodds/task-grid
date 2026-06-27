@@ -21,6 +21,7 @@ services:
     command: >
       python -m taskgrid.worker
       --broker ${MANAGER_URL:-http://host.docker.internal:8000}
+      --worker-token ${TASKGRID_WORKER_TOKEN:-}
       --worker-id ${WORKER_ID:-docker-node-1}
       --module ${TASK_MODULE:-examples.custom_tasks}
       --service-name ${SERVICE_NAME:-taskgrid-worker}
@@ -29,6 +30,9 @@ services:
       --poll-seconds ${POLL_SECONDS:-1.0}
       --heartbeat-seconds ${HEARTBEAT_SECONDS:-2.0}
       --broker-pool-size ${BROKER_POOL_SIZE:-4}
+      --batch-lease-size ${BATCH_LEASE_SIZE:-1}
+      --long-poll-seconds ${LONG_POLL_SECONDS:-0}
+      --execution-mode ${EXECUTION_MODE:-process}
       --log-root /logs
       --log-api-host 0.0.0.0
       --log-api-port ${LOG_API_PORT:-9201}

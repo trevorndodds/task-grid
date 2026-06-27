@@ -7,19 +7,44 @@ from urllib import parse, request
 
 
 class TaskGridClient:
-    def __init__(self, base_url: str = "http://127.0.0.1:8000") -> None:
+    def __init__(self, base_url: str = "http://127.0.0.1:8000", client_id: str | None = None, resume_token: str | None = None, api_token: str | None = None) -> None:
         self.base_url = base_url.rstrip("/")
+        self.client_id = client_id
+        self.resume_token = resume_token
+        self.api_token = api_token
+
+    def attach(self, client_id: str, resume_token: str) -> None:
+        self.client_id = client_id
+        self.resume_token = resume_token
+
+    def _headers(self, has_payload: bool = False) -> dict[str, str]:
+        headers: dict[str, str] = {"Content-Type": "application/json"} if has_payload else {}
+        if self.api_token:
+            headers["X-TaskGrid-Token"] = self.api_token
+        return headers
 
     def _request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
         data = json.dumps(payload).encode("utf-8") if payload is not None else None
         req = request.Request(
             f"{self.base_url}{path}",
             data=data,
-            headers={"Content-Type": "application/json"} if payload is not None else {},
+            headers=self._headers(payload is not None),
             method=method,
         )
         with request.urlopen(req, timeout=30) as response:
             return json.loads(response.read().decode("utf-8"))
+
+
+    def _raw_request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> bytes:
+        data = json.dumps(payload).encode("utf-8") if payload is not None else None
+        req = request.Request(
+            f"{self.base_url}{path}",
+            data=data,
+            headers=self._headers(payload is not None),
+            method=method,
+        )
+        with request.urlopen(req, timeout=30) as response:
+            return response.read()
 
     def submit(
         self,
@@ -34,8 +59,10 @@ class TaskGridClient:
         session_name: str | None = None,
         session_metadata: dict[str, Any] | None = None,
         require_capable_worker: bool = False,
+        client_id: str | None = None,
+        resume_token: str | None = None,
     ) -> dict[str, Any]:
-        return self._request(
+        out = self._request(
             "POST",
             "/jobs",
             {
@@ -50,8 +77,13 @@ class TaskGridClient:
                 "session_name": session_name,
                 "session_metadata": session_metadata or {},
                 "require_capable_worker": require_capable_worker,
+                "client_id": client_id or self.client_id,
+                "resume_token": resume_token or self.resume_token,
             },
         )
+        self.client_id = out.get("client_id") or self.client_id
+        self.resume_token = out.get("resume_token") or self.resume_token
+        return out
 
     def get_job(self, job_id: str) -> dict[str, Any]:
         return self._request("GET", f"/jobs/{job_id}")
@@ -59,11 +91,33 @@ class TaskGridClient:
     def sessions(self) -> list[dict[str, Any]]:
         return self._request("GET", "/sessions")
 
+    def my_sessions(self, limit: int = 100, status: str | None = None) -> list[dict[str, Any]]:
+        if not self.client_id or not self.resume_token:
+            raise ValueError("client_id and resume_token are required to list resumable sessions")
+        params = [("resume_token", self.resume_token), ("limit", str(limit))]
+        if status:
+            params.append(("status", status))
+        return self._request("GET", f"/clients/{parse.quote(self.client_id, safe='')}/sessions?{parse.urlencode(params)}")
+
+    def resume_session(self, session_id: str) -> dict[str, Any]:
+        if not self.client_id or not self.resume_token:
+            raise ValueError("client_id and resume_token are required to resume a session")
+        return self._request("GET", f"/clients/{parse.quote(self.client_id, safe='')}/sessions/{parse.quote(session_id, safe='')}?resume_token={parse.quote(self.resume_token, safe='')}")
+
     def get_session(self, session_id: str) -> dict[str, Any]:
         return self._request("GET", f"/sessions/{session_id}")
 
     def set_session_priority(self, session_id: str, priority: int) -> dict[str, Any]:
         return self._request("POST", f"/sessions/{session_id}/priority", {"priority": priority})
+
+    def pause_session(self, session_id: str, reason: str | None = None) -> dict[str, Any]:
+        return self._request("POST", f"/sessions/{session_id}/pause", {"reason": reason})
+
+    def resume_session(self, session_id: str) -> dict[str, Any]:
+        return self._request("POST", f"/sessions/{session_id}/resume", {})
+
+    def set_sessions_paused(self, session_ids: list[str], paused: bool, reason: str | None = None) -> dict[str, Any]:
+        return self._request("POST", "/sessions/bulk-pause", {"session_ids": session_ids, "paused": paused, "reason": reason})
 
     def session_jobs(self, session_id: str) -> list[dict[str, Any]]:
         return self._request("GET", f"/sessions/{session_id}/jobs")
@@ -71,14 +125,28 @@ class TaskGridClient:
     def session_results(self, session_id: str) -> dict[str, Any]:
         return self._request("GET", f"/sessions/{session_id}/results")
 
+    def export_session_results(self, session_id: str, format: str = "json", order: str = "input", failed_only: bool = False) -> bytes:
+        params = parse.urlencode({"format": format, "order": order, "failed_only": str(bool(failed_only)).lower()})
+        return self._raw_request("GET", f"/sessions/{session_id}/results/export?{params}")
+
     def tasks(self, job_id: str) -> list[dict[str, Any]]:
         return self._request("GET", f"/jobs/{job_id}/tasks")
 
     def results(self, job_id: str) -> dict[str, Any]:
         return self._request("GET", f"/jobs/{job_id}/results")
 
-    def cancel(self, job_id: str) -> dict[str, Any]:
-        return self._request("POST", f"/jobs/{job_id}/cancel", {})
+    def export_results(self, job_id: str, format: str = "json", order: str = "input", failed_only: bool = False) -> bytes:
+        params = parse.urlencode({"format": format, "order": order, "failed_only": str(bool(failed_only)).lower()})
+        return self._raw_request("GET", f"/jobs/{job_id}/results/export?{params}")
+
+    def cancel(self, job_id: str, mode: str = "graceful") -> dict[str, Any]:
+        return self._request("POST", f"/jobs/{job_id}/cancel?mode={parse.quote(mode, safe='')}", {})
+
+    def pause_job(self, job_id: str, reason: str | None = None) -> dict[str, Any]:
+        return self._request("POST", f"/jobs/{job_id}/pause", {"reason": reason})
+
+    def resume_job(self, job_id: str) -> dict[str, Any]:
+        return self._request("POST", f"/jobs/{job_id}/resume", {})
 
     def retry_failed(self, job_id: str, reset_attempts: bool = True) -> dict[str, Any]:
         suffix = "true" if reset_attempts else "false"
@@ -114,6 +182,28 @@ class TaskGridClient:
     def set_worker_instances(self, worker_id: str, desired_instances: int) -> dict[str, Any]:
         return self.set_worker_concurrency(worker_id, desired_instances)
 
+    def disable_worker(self, worker_id: str, reason: str | None = None) -> dict[str, Any]:
+        return self._request("POST", f"/workers/{worker_id}/disable", {"reason": reason})
+
+    def enable_worker(self, worker_id: str, reason: str | None = None) -> dict[str, Any]:
+        return self._request("POST", f"/workers/{worker_id}/enable", {"reason": reason})
+
+    def set_workers_disabled(self, worker_ids: list[str], disabled: bool, reason: str | None = None) -> dict[str, Any]:
+        return self._request("POST", "/workers/bulk-state", {"worker_ids": worker_ids, "disabled": disabled, "reason": reason})
+
+    def disable_workers(self, worker_ids: list[str], reason: str | None = None) -> dict[str, Any]:
+        return self.set_workers_disabled(worker_ids, True, reason=reason)
+
+    def enable_workers(self, worker_ids: list[str], reason: str | None = None) -> dict[str, Any]:
+        return self.set_workers_disabled(worker_ids, False, reason=reason)
+
+
+
+    def recovery_status(self) -> dict[str, Any]:
+        return self._request("GET", "/maintenance/status")
+
+    def recover_expired_leases(self) -> dict[str, Any]:
+        return self._request("POST", "/maintenance/recover", {})
 
     def worker_logs(self, worker_id: str) -> dict[str, Any]:
         return self._request("GET", f"/workers/{worker_id}/logs")
@@ -121,10 +211,56 @@ class TaskGridClient:
     def worker_log(self, worker_id: str, filename: str, tail_bytes: int = 1_000_000) -> str:
         req = request.Request(
             f"{self.base_url}/workers/{worker_id}/logs/{parse.quote(filename, safe='/')}?tail={int(tail_bytes)}",
+            headers=self._headers(False),
             method="GET",
         )
         with request.urlopen(req, timeout=30) as response:
             return response.read().decode("utf-8", errors="replace")
+
+    def purge_offline_workers(self, active_seconds: int | None = None, include_running: bool = False) -> dict[str, Any]:
+        params = []
+        if active_seconds is not None:
+            params.append(("active_seconds", str(int(active_seconds))))
+        if include_running:
+            params.append(("include_running", "true"))
+        query = "?" + parse.urlencode(params) if params else ""
+        return self._request("POST", f"/workers/purge-offline{query}", {})
+
+
+    def retention_preview(
+        self,
+        completed_days: int = 30,
+        failed_days: int = 90,
+        event_days: int = 30,
+        purge_workers_active_seconds: int | None = None,
+    ) -> dict[str, Any]:
+        params = [
+            ("completed_days", str(int(completed_days))),
+            ("failed_days", str(int(failed_days))),
+            ("event_days", str(int(event_days))),
+        ]
+        if purge_workers_active_seconds is not None:
+            params.append(("purge_workers_active_seconds", str(int(purge_workers_active_seconds))))
+        return self._request("GET", f"/maintenance/retention/preview?{parse.urlencode(params)}")
+
+    def apply_retention_cleanup(
+        self,
+        completed_days: int = 30,
+        failed_days: int = 90,
+        event_days: int = 30,
+        purge_workers_active_seconds: int | None = None,
+        manager_log_keep_bytes: int | None = None,
+    ) -> dict[str, Any]:
+        params = [
+            ("completed_days", str(int(completed_days))),
+            ("failed_days", str(int(failed_days))),
+            ("event_days", str(int(event_days))),
+        ]
+        if purge_workers_active_seconds is not None:
+            params.append(("purge_workers_active_seconds", str(int(purge_workers_active_seconds))))
+        if manager_log_keep_bytes is not None:
+            params.append(("manager_log_keep_bytes", str(int(manager_log_keep_bytes))))
+        return self._request("POST", f"/maintenance/retention/apply?{parse.urlencode(params)}", {})
 
     def wait(self, job_id: str, poll_seconds: float = 1.0, timeout_seconds: float | None = None) -> dict[str, Any]:
         started = time.time()
@@ -136,5 +272,3 @@ class TaskGridClient:
                 raise TimeoutError(f"job {job_id} did not finish in {timeout_seconds}s")
             time.sleep(poll_seconds)
 
-# Backwards-compatible alias for code written before the rename.
-GridLiteClient = TaskGridClient

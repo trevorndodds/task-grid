@@ -7,13 +7,15 @@ import json
 import logging
 import os
 import random
+import queue
+from collections import deque
 import socket
 import sys
 import threading
 import time
 import traceback
 import uuid
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -27,7 +29,7 @@ from requests.adapters import HTTPAdapter
 
 from .tasks import list_task_types, load_modules, run_task
 
-VERSION = "0.10.1"
+VERSION = "0.21.0"
 MAX_INSTANCES = 128
 MAX_LOG_TAIL_BYTES = 1_000_000
 MAX_EMBEDDED_TASK_OUTPUT_BYTES = 250_000
@@ -35,6 +37,10 @@ MAX_EMBEDDED_TASK_OUTPUT_BYTES = 250_000
 
 def _clamp_instance_count(value: int) -> int:
     return max(1, min(MAX_INSTANCES, int(value)))
+
+
+def _clamp_instance_target(value: int) -> int:
+    return max(0, min(MAX_INSTANCES, int(value)))
 
 
 # Backwards-compatible name for older imports/tests/docs. The value now means
@@ -238,33 +244,49 @@ def _instance_log_dir(node_log_dir: Path, instance_id: str) -> Path:
 
 
 class BrokerClient:
-    """Small shared broker client for a worker node.
+    """Bounded shared broker client for a worker node.
 
-    The node owns one HTTP session with a bounded connection pool. Logical
-    instances share it through a lightweight lock so an idle node with many
-    instances does not open a storm of sockets against the broker.
+    Logical instances share a small pool of HTTP sessions. This avoids creating
+    one socket pool per instance, but it also avoids serializing every lease,
+    completion, and heartbeat call behind a single global lock.
     """
 
-    def __init__(self, base_url: str, *, timeout_seconds: float = 30.0, pool_size: int = 8) -> None:
+    def __init__(self, base_url: str, *, timeout_seconds: float = 30.0, pool_size: int = 8, token: str | None = None) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
-        self._lock = threading.RLock()
-        self._session = requests.Session()
-        adapter = HTTPAdapter(pool_connections=max(1, pool_size), pool_maxsize=max(1, pool_size), pool_block=True)
-        self._session.mount("http://", adapter)
-        self._session.mount("https://", adapter)
+        self.pool_size = max(1, pool_size)
+        self.token = (token or "").strip() or None
+        self._closed = False
+        self._sessions: queue.LifoQueue[requests.Session] = queue.LifoQueue(maxsize=self.pool_size)
+        for _ in range(self.pool_size):
+            session = requests.Session()
+            adapter = HTTPAdapter(pool_connections=1, pool_maxsize=1, pool_block=True)
+            session.mount("http://", adapter)
+            session.mount("https://", adapter)
+            self._sessions.put(session)
 
     def post_json(self, path: str, payload: dict[str, Any]) -> Any:
-        with self._lock:
-            response = self._session.post(f"{self.base_url}{path}", json=payload, timeout=self.timeout_seconds)
+        if self._closed:
+            raise RuntimeError("broker client is closed")
+        session = self._sessions.get(block=True)
+        try:
+            headers = {"X-TaskGrid-Token": self.token} if self.token else None
+            response = session.post(f"{self.base_url}{path}", json=payload, headers=headers, timeout=self.timeout_seconds)
             response.raise_for_status()
             if not response.content:
                 return None
             return response.json()
+        finally:
+            self._sessions.put(session)
 
     def close(self) -> None:
-        with self._lock:
-            self._session.close()
+        self._closed = True
+        while True:
+            try:
+                session = self._sessions.get_nowait()
+            except queue.Empty:
+                break
+            session.close()
 
 
 def post_json(base_url: str, path: str, payload: dict[str, Any]) -> Any:
@@ -418,6 +440,9 @@ def _make_metadata(
     pending_instances: int | None = None,
     poll_seconds: float | None = None,
     broker_pool_size: int | None = None,
+    execution_mode: str | None = None,
+    batch_lease_size: int | None = None,
+    long_poll_seconds: float | None = None,
 ) -> dict[str, Any]:
     snapshots = [state.snapshot() for state in sorted(instances.values(), key=lambda item: item.index)]
     active_instances = [item["instance_id"] for item in snapshots if item.get("current_task_id")]
@@ -444,6 +469,12 @@ def _make_metadata(
         metadata["poll_seconds"] = poll_seconds
     if broker_pool_size is not None:
         metadata["broker_pool_size"] = broker_pool_size
+    if execution_mode is not None:
+        metadata["execution_mode"] = execution_mode
+    if batch_lease_size is not None:
+        metadata["batch_lease_size"] = batch_lease_size
+    if long_poll_seconds is not None:
+        metadata["long_poll_seconds"] = long_poll_seconds
     if log_url:
         metadata["log_url"] = log_url
     if pending_instances is not None and pending_instances != configured_instances:
@@ -452,7 +483,16 @@ def _make_metadata(
     return metadata
 
 
+def _response_disabled(response: dict[str, Any]) -> bool:
+    try:
+        return bool(int(response.get("disabled") or 0))
+    except (TypeError, ValueError):
+        return str(response.get("disabled") or "").lower() in {"true", "yes", "disabled"}
+
+
 def _desired_from_heartbeat(response: dict[str, Any], fallback: int) -> int:
+    if _response_disabled(response):
+        return 0
     raw = response.get("desired_concurrency")
     if raw is None:
         raw = (response.get("metadata") or {}).get("desired_concurrency")
@@ -489,6 +529,108 @@ def _active_instance_ids(instances: dict[str, InstanceState]) -> list[str]:
     ]
 
 
+def _instance_from_assigned(worker_id: str, assigned: str | None) -> str | None:
+    text = str(assigned or "")
+    prefix = f"{worker_id}-"
+    if text.startswith(prefix):
+        return text[len(prefix) :]
+    return None
+
+
+class LeaseCoordinator:
+    """Optional node-level batch lease coordinator.
+
+    Instances remain single-task loops. When batch leasing is enabled, the first
+    idle instance to ask for work leases tasks for several currently idle
+    instances in one manager request, then each instance consumes only its own
+    pre-assigned task. This reduces manager connection pressure while preserving
+    precise worker-instance assignment in task rows.
+    """
+
+    def __init__(
+        self,
+        *,
+        broker: BrokerClient,
+        worker_id: str,
+        lease_seconds: int,
+        batch_lease_size: int,
+        long_poll_seconds: float,
+        states: dict[str, "InstanceState"],
+        logger: logging.Logger,
+    ) -> None:
+        self.broker = broker
+        self.worker_id = worker_id
+        self.lease_seconds = lease_seconds
+        self.batch_lease_size = max(1, int(batch_lease_size))
+        self.long_poll_seconds = max(0.0, float(long_poll_seconds or 0.0))
+        self.states = states
+        self.logger = logger
+        self._lock = threading.Lock()
+        self._queues: dict[str, deque[dict[str, Any]]] = {}
+
+    def _pop_locked(self, instance_id: str) -> dict[str, Any] | None:
+        q = self._queues.get(instance_id)
+        if q:
+            try:
+                return q.popleft()
+            except IndexError:
+                return None
+        return None
+
+    def acquire(self, state: "InstanceState") -> list[dict[str, Any]]:
+        if self.batch_lease_size <= 1:
+            return self.broker.post_json(
+                "/tasks/lease",
+                {
+                    "worker_id": self.worker_id,
+                    "instance_id": state.instance_id,
+                    "limit": 1,
+                    "lease_seconds": self.lease_seconds,
+                    "wait_seconds": self.long_poll_seconds,
+                },
+            ) or []
+
+        with self._lock:
+            existing = self._pop_locked(state.instance_id)
+            if existing:
+                return [existing]
+
+            idle_ids: list[str] = []
+            for item in sorted(self.states.values(), key=lambda value: value.index):
+                snap = item.snapshot()
+                if snap.get("current_task_id"):
+                    continue
+                if snap.get("status") in {"stopping", "stopped"}:
+                    continue
+                if self._queues.get(item.instance_id):
+                    continue
+                idle_ids.append(item.instance_id)
+                if len(idle_ids) >= self.batch_lease_size:
+                    break
+            if state.instance_id not in idle_ids:
+                idle_ids.insert(0, state.instance_id)
+            idle_ids = idle_ids[: self.batch_lease_size]
+            if not idle_ids:
+                return []
+
+            leased = self.broker.post_json(
+                "/tasks/lease-batch",
+                {
+                    "worker_id": self.worker_id,
+                    "instance_ids": idle_ids,
+                    "lease_seconds": self.lease_seconds,
+                    "wait_seconds": self.long_poll_seconds,
+                },
+            ) or []
+            for task in leased:
+                instance_id = task.get("leased_instance_id") or _instance_from_assigned(self.worker_id, task.get("assigned_worker_id"))
+                if not instance_id:
+                    instance_id = state.instance_id
+                self._queues.setdefault(str(instance_id), deque()).append(task)
+            found = self._pop_locked(state.instance_id)
+            return [found] if found else []
+
+
 def _sleep_with_stop(stop_event: threading.Event, seconds: float) -> bool:
     return stop_event.wait(max(0.01, seconds))
 
@@ -500,27 +642,38 @@ def _instance_loop(
     worker_id: str,
     lease_seconds: int,
     poll_seconds: float,
+    lease_coordinator: LeaseCoordinator | None,
     modules: list[str],
     logger: logging.Logger,
+    execution_mode: str,
 ) -> None:
-    # One process-backed execution slot per logical instance. The instance loop
-    # leases exactly one task, waits for it to finish, returns the result, then
-    # asks for the next pending task.
-    executor = ProcessPoolExecutor(max_workers=1)
+    # One execution slot per logical instance. The default process mode isolates
+    # CPU-heavy tasks. Thread/inline modes are useful for trusted tiny or I/O-heavy
+    # tasks where process startup/scheduling overhead dominates throughput.
+    if execution_mode == "process":
+        executor: ProcessPoolExecutor | ThreadPoolExecutor | None = ProcessPoolExecutor(max_workers=1)
+    elif execution_mode == "thread":
+        executor = ThreadPoolExecutor(max_workers=1)
+    else:
+        executor = None
     backoff = poll_seconds
     idle_jitter = random.uniform(0.0, max(0.05, poll_seconds))
     if _sleep_with_stop(state.stop_event, idle_jitter):
-        executor.shutdown(wait=False, cancel_futures=True)
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
         return
     try:
         state.set_status("idle")
         while not state.stop_event.is_set():
             try:
                 state.mark_poll()
-                leased = broker.post_json(
-                    "/tasks/lease",
-                    {"worker_id": worker_id, "instance_id": state.instance_id, "limit": 1, "lease_seconds": lease_seconds},
-                ) or []
+                if lease_coordinator is not None:
+                    leased = lease_coordinator.acquire(state)
+                else:
+                    leased = broker.post_json(
+                        "/tasks/lease",
+                        {"worker_id": worker_id, "instance_id": state.instance_id, "limit": 1, "lease_seconds": lease_seconds},
+                    ) or []
                 if not leased:
                     state.set_status("idle", None, None)
                     # Idle polling backs off a little and has jitter so a 50-instance
@@ -539,17 +692,27 @@ def _instance_loop(
                 state.set_status("running", task_id, None)
                 logger.info("%s %s leased executor=%s-%s", task_id, task_type, worker_id, state.instance_id)
 
-                future = executor.submit(
-                    _execute_task,
-                    task_id,
-                    task_type,
-                    payload,
-                    modules,
-                    state.instance_id,
-                    str(state.log_dir),
-                )
                 try:
-                    result = future.result()
+                    if executor is None:
+                        result = _execute_task(
+                            task_id,
+                            task_type,
+                            payload,
+                            modules,
+                            state.instance_id,
+                            str(state.log_dir),
+                        )
+                    else:
+                        future = executor.submit(
+                            _execute_task,
+                            task_id,
+                            task_type,
+                            payload,
+                            modules,
+                            state.instance_id,
+                            str(state.log_dir),
+                        )
+                        result = future.result()
                     broker.post_json(f"/tasks/{task_id}/complete", {"worker_id": worker_id, "instance_id": state.instance_id, "result": result})
                     state.mark_completed()
                     logger.info(
@@ -584,13 +747,15 @@ def _instance_loop(
                     break
     finally:
         state.set_status("stopping", None, None)
-        executor.shutdown(wait=True, cancel_futures=False)
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=False)
         state.set_status("stopped", None, None)
         logger.info("instance stopped instance=%s", state.instance_id)
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="TaskGrid worker node supervisor")
     parser.add_argument("--broker", default="http://127.0.0.1:8000", help="TaskGrid API URL")
+    parser.add_argument("--worker-token", default=os.environ.get("TASKGRID_WORKER_TOKEN"), help="Optional worker token sent to the manager")
     parser.add_argument("--worker-id", default=f"worker_{socket.gethostname()}_{uuid.uuid4().hex[:6]}")
     parser.add_argument("--poll-seconds", type=float, default=1.0, help="Base idle polling delay per instance. Idle instances back off with jitter.")
     parser.add_argument("--heartbeat-seconds", type=float, default=2.0, help="How often the node supervisor heartbeats to the broker")
@@ -599,14 +764,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--concurrency", type=int, default=None, help="Deprecated alias for --instances")
     parser.add_argument("--limit", type=int, default=None, help="Deprecated alias for --instances when --instances/--concurrency are omitted")
     parser.add_argument("--broker-pool-size", type=int, default=4, help="Max pooled HTTP connections from this node to the broker")
+    parser.add_argument("--batch-lease-size", type=int, default=int(os.environ.get("TASKGRID_BATCH_LEASE_SIZE") or "1"), help="Optional node-level lease batch size. 1 keeps per-instance leasing; >1 leases for multiple idle instances per request.")
+    parser.add_argument("--long-poll-seconds", type=float, default=float(os.environ.get("TASKGRID_LONG_POLL_SECONDS") or "0"), help="Optional manager long-poll wait for idle lease requests. 0 disables long polling.")
+    parser.add_argument(
+        "--execution-mode",
+        choices=["process", "thread", "inline"],
+        default=os.environ.get("TASKGRID_EXECUTION_MODE", "process"),
+        help="How each single-task instance runs task code. process isolates CPU work; thread/inline reduce overhead for tiny trusted tasks.",
+    )
     parser.add_argument("--module", action="append", default=[], help="Import a Python module that registers @task functions")
     parser.add_argument("--tag", action="append", default=[], help="Worker capability tag, e.g. gpu or risk-model-v2. Can be repeated.")
     parser.add_argument("--service-name", default=os.environ.get("TASKGRID_SERVICE_NAME"), help="Optional service/application name advertised to the manager")
     parser.add_argument("--service-version", default=os.environ.get("TASKGRID_SERVICE_VERSION"), help="Optional service/application version advertised to the manager")
-    parser.add_argument("--log-root", default=os.environ.get("TASKGRID_LOG_ROOT") or os.environ.get("GRIDLITE_LOG_ROOT") or "./taskgrid_logs", help="Root folder for per-node/per-instance logs")
-    parser.add_argument("--log-api-host", default=os.environ.get("TASKGRID_LOG_HOST") or os.environ.get("GRIDLITE_LOG_HOST") or "127.0.0.1", help="Host/interface for the worker log API")
-    parser.add_argument("--log-api-port", type=int, default=int(os.environ.get("TASKGRID_LOG_PORT") or os.environ.get("GRIDLITE_LOG_PORT") or "0"), help="Port for worker log API. Use 0 for a free port, -1 to disable.")
-    parser.add_argument("--log-public-url", default=os.environ.get("TASKGRID_LOG_PUBLIC_URL") or os.environ.get("GRIDLITE_LOG_PUBLIC_URL"), help="URL the broker should use to reach this worker's log API")
+    parser.add_argument("--log-root", default=os.environ.get("TASKGRID_LOG_ROOT") or "./taskgrid_logs", help="Root folder for per-node/per-instance logs")
+    parser.add_argument("--log-api-host", default=os.environ.get("TASKGRID_LOG_HOST") or "127.0.0.1", help="Host/interface for the worker log API")
+    parser.add_argument("--log-api-port", type=int, default=int(os.environ.get("TASKGRID_LOG_PORT") or "0"), help="Port for worker log API. Use 0 for a free port, -1 to disable.")
+    parser.add_argument("--log-public-url", default=os.environ.get("TASKGRID_LOG_PUBLIC_URL"), help="URL the broker should use to reach this worker's log API")
     args = parser.parse_args(argv)
 
     logger, node_log_dir = _setup_logging(args.worker_id, args.log_root)
@@ -623,10 +796,19 @@ def main(argv: list[str] | None = None) -> int:
     desired_instances = _clamp_instance_count(initial_instances)
     pending_instances: int | None = None
     instances: dict[str, InstanceState] = {}
-    broker = BrokerClient(args.broker, pool_size=max(1, min(32, int(args.broker_pool_size))))
+    broker = BrokerClient(args.broker, pool_size=max(1, min(64, int(args.broker_pool_size))), token=args.worker_token)
+    lease_coordinator = LeaseCoordinator(
+        broker=broker,
+        worker_id=args.worker_id,
+        lease_seconds=args.lease_seconds,
+        batch_lease_size=max(1, int(args.batch_lease_size)),
+        long_poll_seconds=max(0.0, float(args.long_poll_seconds)),
+        states=instances,
+        logger=logger,
+    )
 
     logger.info(
-        "TaskGrid worker node %s polling %s tags=%s task_types=%s instances=%s poll_seconds=%s broker_pool_size=%s log_dir=%s log_url=%s",
+        "TaskGrid worker node %s polling %s tags=%s task_types=%s instances=%s poll_seconds=%s broker_pool_size=%s batch_lease_size=%s long_poll_seconds=%s execution_mode=%s log_dir=%s log_url=%s",
         args.worker_id,
         args.broker,
         tags,
@@ -634,6 +816,9 @@ def main(argv: list[str] | None = None) -> int:
         desired_instances,
         args.poll_seconds,
         args.broker_pool_size,
+        args.batch_lease_size,
+        args.long_poll_seconds,
+        args.execution_mode,
         node_log_dir,
         log_url or "disabled",
     )
@@ -652,8 +837,10 @@ def main(argv: list[str] | None = None) -> int:
                 "worker_id": args.worker_id,
                 "lease_seconds": args.lease_seconds,
                 "poll_seconds": max(0.1, float(args.poll_seconds)),
+                "lease_coordinator": lease_coordinator,
                 "modules": args.module,
                 "logger": logger,
+                "execution_mode": args.execution_mode,
             },
             name=f"{args.worker_id}-{instance_id}",
             daemon=True,
@@ -675,7 +862,7 @@ def main(argv: list[str] | None = None) -> int:
             logger.info("instance stop requested instance=%s", instance_id)
 
     def reconcile_instances(target: int) -> None:
-        target = _clamp_instance_count(target)
+        target = _clamp_instance_target(target)
         # Add missing instances immediately.
         for index in range(1, target + 1):
             start_instance(index)
@@ -702,7 +889,10 @@ def main(argv: list[str] | None = None) -> int:
             log_dir=node_log_dir,
             log_url=log_url,
             poll_seconds=max(0.1, float(args.poll_seconds)),
-            broker_pool_size=max(1, min(32, int(args.broker_pool_size))),
+            broker_pool_size=max(1, min(64, int(args.broker_pool_size))),
+            execution_mode=args.execution_mode,
+            batch_lease_size=max(1, int(args.batch_lease_size)),
+            long_poll_seconds=max(0.0, float(args.long_poll_seconds)),
         )
         payload = {
             "worker_id": args.worker_id,
@@ -765,7 +955,10 @@ def main(argv: list[str] | None = None) -> int:
                         log_dir=node_log_dir,
                         log_url=log_url,
                         poll_seconds=max(0.1, float(args.poll_seconds)),
-                        broker_pool_size=max(1, min(32, int(args.broker_pool_size))),
+                        broker_pool_size=max(1, min(64, int(args.broker_pool_size))),
+                        execution_mode=args.execution_mode,
+                        batch_lease_size=max(1, int(args.batch_lease_size)),
+                        long_poll_seconds=max(0.0, float(args.long_poll_seconds)),
                     ),
                 }
                 broker.post_json("/workers/heartbeat", payload)

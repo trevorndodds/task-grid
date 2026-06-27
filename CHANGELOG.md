@@ -1,13 +1,123 @@
 # Changelog
 
+## 0.21.0 - Session and job pause controls
+
+- Added manager/API/SDK controls to pause and resume service sessions.
+- Added manager/API/SDK controls to pause and resume individual jobs.
+- Paused sessions and jobs keep queued tasks queued but prevent new task leases.
+- Running tasks are allowed to finish; pause is a scheduling hold, not cancellation.
+- Added bulk session pause/resume API support.
+- Updated web UI to show paused pills and pause/resume actions on session and job detail pages.
+- Lease and batch-lease paths now skip paused sessions and paused jobs.
+
+## 0.20.0 - Worker disable controls
+
+- Added manager-controlled worker enable/disable state.
+- Disabled workers continue to heartbeat but do not receive new task leases.
+- Heartbeating disabled workers scale their local instance loops down to zero and restore their configured instance count when re-enabled.
+- Added API endpoints for disabling/enabling one worker and bulk state updates.
+- Added Workers UI controls for single-worker and selected-worker disable/enable actions.
+- Added SDK helpers for worker state controls.
+- Lease and batch-lease paths now skip disabled worker nodes.
+
+## 0.18.0 - Exports, retention, and batch leasing
+
+- Added downloadable job/session result exports as JSON or CSV.
+- Added failed-task report exports for jobs and service sessions.
+- Added retention preview/apply APIs and `/ui/manager/retention`.
+- Added cautious cleanup for terminal sessions/jobs/tasks, old manager events, optional stale worker purging, and optional manager log truncation.
+- Added node-level batch leasing with `POST /tasks/lease-batch` and worker `--batch-lease-size`.
+- Added optional lease long polling with `--long-poll-seconds` / `wait_seconds`.
+- Preserved precise task assignment to `worker-id-instance-id` when using batch leasing.
+- Added SDK helpers for exports and retention cleanup.
+- Updated Docker Compose, README, API docs, SDK docs, and scale docs.
+
+## 0.17.0 - Normal-mode logging reduction
+
+- Made task rows, job counters, and session counters the explicit source of truth for task tracking.
+- Added `TASKGRID_EVENT_MODE=debug` and `TASKGRID_VERBOSE_TASK_EVENTS=1` for verbose successful task lifecycle traces.
+- Normal mode now suppresses high-volume successful `TaskAccepted` and `TaskCompleted` event/manager-log writes.
+- Important operational events still record normally, including submissions, warnings, failures, retries, recovery actions, ignored late results, worker config changes, and offline worker purge actions.
+- Updated Manager Log and Data Flow UI copy to clarify normal vs debug logging.
+- Updated API/scale documentation and environment examples for the new logging mode.
+
+## 0.16.0 - Manager connection stress and write-path optimization
+
+- Added `scripts/benchmark_manager_connections.py` to stress manager lease/complete traffic without worker process-pool overhead.
+- Added simulated high-instance manager stress results to `docs/SCALE.md`.
+- Optimized normal task accepted/completed state updates with incremental job/session counter updates.
+- Documented manager write-path bottlenecks and next scaling steps.
+
+## 0.15.0 - High-instance overload testing and execution modes
+
+- Added worker `--execution-mode process|thread|inline`.
+- Kept `process` as the default for isolated CPU-heavy work.
+- Added `thread` and `inline` modes for trusted tiny or I/O-heavy tasks where process scheduling overhead dominates.
+- Added `TASKGRID_EXECUTION_MODE` / `EXECUTION_MODE` Docker configuration examples.
+- Extended `scripts/benchmark_scale.py` with `--execution-mode`.
+- Documented 100-instance-per-worker overload test results and tuning guidance in `docs/SCALE.md`.
+
+## 0.14.0 - Scale benchmark and lease-path optimization
+
+- Added `scripts/benchmark_scale.py` for local manager/worker/client scale tests.
+- Added `docs/SCALE.md` with validated local smoke results and tuning guidance.
+- Removed per-lease worker heartbeat writes; worker supervisors now remain the heartbeat source of truth.
+- Added a bounded HTTP session pool per worker node so multiple instances do not serialize all broker calls or open unbounded sockets.
+- Bulk-insert task rows during job creation.
+- Lease logic now respects worker-advertised task types when workers publish a task catalog.
+- Added SQLite scale indexes for assigned tasks, task finish ordering, task status/update scans, and event time scans.
+- Set SQLite `synchronous=NORMAL` by default while keeping WAL mode. Override with `TASKGRID_SQLITE_SYNCHRONOUS`.
+- Added `TASKGRID_LEASE_CANDIDATE_MULTIPLIER` for tuning candidate scans when tag-constrained work is queued.
+- Documented benchmark commands and scale tuning knobs.
+
+
+
+## 0.13.0 - Offline worker purge
+
+- Added manager/API support for purging stale/offline worker registry rows.
+- Added `/workers/purge-offline` and SDK `purge_offline_workers()`.
+- Added purge buttons to the Workers and Recovery UI pages.
+- Purging removes stale worker/config rows only; jobs, tasks, results, events, and remote worker logs are preserved.
+- Workers with running task assignments are skipped by default so operators can recover expired leases first.
+- Added `WorkerPurgeOfflineRun` and `WorkerPurgedOffline` manager events.
+
+
+## 0.12.0 - Recovery and stale worker hardening
+
+- Added manager-side recovery status for stale workers and expired running task leases.
+- Added `GET /maintenance/status` and `POST /maintenance/recover`.
+- Added a Recovery page in the web UI at `/ui/manager/recovery`.
+- Expired task leases now log assigned worker/instance, attempt count, and next status before being requeued or failed.
+- Late or duplicate task completions/failures are ignored safely and recorded as `TaskResultIgnored` / `TaskFailureIgnored`.
+- Dashboard and Workers UI now surface stale workers and expired lease counts.
+- SDK now includes `recovery_status()` and `recover_expired_leases()`.
+- Added tests for expired lease recovery, stale workers, ignored late results, and Recovery UI/API paths.
+
+## Documentation polish
+
+- Cleaned up README wording so it reads like a project guide rather than an implementation log.
+- Replaced old phase/iteration-style README headings with operational sections for worker capacity, capability-aware scheduling, retries, and logging.
+- Removed the standalone task-catalog duplicate from the end of the README and folded it into the operational capabilities section.
+
+## 0.11.0 - Client resume tokens and cleanup
+
+- Removed the legacy package-name compatibility shim for a clean new TaskGrid repository.
+- Removed legacy environment-variable fallbacks; runtime configuration now uses `TASKGRID_*`.
+- Added `client_id` and `resume_token` to service sessions so clients can disconnect and later reattach.
+- Job submission now returns the created/reused session client ID and resume token.
+- Added client resume APIs: `GET /clients/{client_id}/sessions` and `GET /clients/{client_id}/sessions/{session_id}`.
+- Added a Client Resume page in the web UI for listing resumable sessions.
+- SDK can now store reconnect credentials, list `my_sessions()`, and `resume_session(...)`.
+- Fixed duplicate task-complete handling in the FastAPI route.
+- Added tests for client resume API/SDK/UI flows.
+
 
 ## 0.10.1 - Rename to TaskGrid
 
-- Renamed the project, package, UI, Docker examples, README, API docs, and SDK docs from GridLite to TaskGrid.
+- Renamed the project, package, UI, Docker examples, README, API docs, and SDK docs to TaskGrid.
 - New commands use `taskgrid`, for example `uvicorn taskgrid.app:app` and `python -m taskgrid.worker`.
-- Added backwards-compatible `gridlite` import/module shims so older scripts can keep working during migration.
-- Added `TaskGridClient` as the primary SDK client class; `GridLiteClient` remains as a compatibility alias.
-- Renamed default runtime paths and environment variables to `TASKGRID_*`, while still accepting legacy `GRIDLITE_*` variables where practical.
+- Added `TaskGridClient` as the primary SDK client class.
+- Renamed default runtime paths and environment variables to `TASKGRID_*`.
 
 
 ## 0.10.0 - Task catalog and capability validation
@@ -78,7 +188,7 @@
 ## 0.8.0 - Manager audit log event codes
 
 - Added broker-side manager JSONL log at `manager.log` by default, configurable with `TASKGRID_MANAGER_LOG`.
-- Manager log now records structured lifecycle events with stable PascalCase codes such as `JobSubmitted`, `TaskAccepted`, `TaskCompleted`, `TaskFailed`, and `TaskLeaseExpiredRequeued`.
+- Manager log records structured lifecycle events with stable PascalCase codes. As of 0.18.0, high-volume successful `TaskAccepted` and `TaskCompleted` events are debug-only; operational events such as `JobSubmitted`, `TaskFailed`, and `TaskLeaseExpiredRequeued` still record normally.
 - Added `code` to persisted events and migration support for older SQLite databases.
 - Added raw manager log endpoint: `GET /manager/log`.
 - Added Manager Log page in the web UI at `/ui/manager/log`.
@@ -169,3 +279,17 @@
 - Updated worker-only compose docs for host-manager, manager-container, and remote-manager layouts.
 - Added `.env.example` for Docker Compose overrides.
 - Updated Dockerfile to create `/data` and `/logs`, set `TASKGRID_MANAGER_LOG`, and run unbuffered.
+
+
+## 0.19.0 - Security and cancellation polish
+
+- Added optional token-based security for manager/admin, client, worker, and UI access.
+- Added `TASKGRID_ADMIN_TOKEN`, `TASKGRID_CLIENT_TOKEN`, `TASKGRID_WORKER_TOKEN`, and `TASKGRID_UI_TOKEN`.
+- Added browser UI login/logout support when `TASKGRID_UI_TOKEN` or `TASKGRID_ADMIN_TOKEN` is configured.
+- Worker nodes can now send `--worker-token` / `TASKGRID_WORKER_TOKEN` to authenticated managers.
+- SDK `TaskGridClient(..., api_token="...")` now sends `X-TaskGrid-Token` on API requests.
+- Changed job cancellation to graceful by default: queued tasks cancel immediately while already-running tasks finish.
+- Added `cancelling` job/session status for graceful cancellation in progress.
+- Added force cancellation mode for operators that want queued and running tasks marked cancelled immediately.
+- Updated UI cancel controls to expose Graceful Cancel and Force Cancel.
+- Added tests for token-protected routes and graceful/force cancellation behavior.

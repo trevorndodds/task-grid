@@ -145,10 +145,11 @@ def test_task_execution_embeds_task_section_in_worker_log_without_task_file():
         assert '{"payload": {"n": 1}}' in text
 
 
-def test_manager_events_have_codes_and_jsonl_log():
+def test_manager_events_have_codes_and_jsonl_log_in_debug_mode():
     with tempfile.TemporaryDirectory() as tmp:
         os.environ["TASKGRID_DB"] = f"{tmp}/manager-events.db"
         os.environ["TASKGRID_MANAGER_LOG"] = f"{tmp}/manager.log"
+        os.environ["TASKGRID_EVENT_MODE"] = "debug"
         from taskgrid import core
 
         job = core.create_job("coded events", "echo", [{"n": 1}])
@@ -169,6 +170,39 @@ def test_manager_events_have_codes_and_jsonl_log():
         assert '"code":"TaskAccepted"' in text
         assert '"code":"TaskCompleted"' in text
         assert job["id"] in text
+
+        os.environ.pop("TASKGRID_EVENT_MODE", None)
+        os.environ.pop("TASKGRID_MANAGER_LOG", None)
+
+
+def test_normal_mode_suppresses_noisy_success_task_events_but_tracks_state():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/normal-events.db"
+        os.environ["TASKGRID_MANAGER_LOG"] = f"{tmp}/manager.log"
+        os.environ.pop("TASKGRID_EVENT_MODE", None)
+        os.environ.pop("TASKGRID_VERBOSE_TASK_EVENTS", None)
+        from taskgrid import core
+
+        job = core.create_job("normal events", "echo", [{"n": 1}, {"n": 2}])
+        task = core.lease_tasks("node-a", limit=1, instance_id="instance-001")[0]
+        core.complete_task(task["id"], "node-a", {"ok": True}, instance_id="instance-001")
+
+        codes = {event["code"] for event in core.list_events(limit=50)}
+        assert "JobSubmitted" in codes
+        assert "TaskAccepted" not in codes
+        assert "TaskCompleted" not in codes
+
+        stored = core.get_task(task["id"])
+        assert stored["status"] == "succeeded"
+        assert stored["assigned_worker_id"] == "node-a-instance-001"
+        assert stored["started_at"]
+        assert stored["finished_at"]
+        assert core.get_job(job["id"])["completed_tasks"] == 1
+
+        text = core.read_manager_log()
+        assert '"code":"JobSubmitted"' in text
+        assert '"code":"TaskAccepted"' not in text
+        assert '"code":"TaskCompleted"' not in text
 
         os.environ.pop("TASKGRID_MANAGER_LOG", None)
 
@@ -306,3 +340,353 @@ def test_task_catalog_reports_worker_capabilities_and_strict_submit_rejects_unkn
             assert "missing_task" in " ".join(exc.details["warnings"])
         else:  # pragma: no cover
             raise AssertionError("strict submit should reject unknown task capability")
+
+
+def test_client_resume_token_lists_owned_sessions_and_blocks_bad_token():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/client-resume.db"
+        from taskgrid import core
+
+        job = core.create_job(
+            "owned session",
+            "echo",
+            [{"n": 1}],
+            session_name="Owned Session",
+            client_id="client-alpha",
+        )
+        assert job["client_id"] == "client-alpha"
+        assert job["resume_token"].startswith("rt_")
+
+        sessions = core.list_client_sessions("client-alpha", job["resume_token"])
+        assert len(sessions) == 1
+        assert sessions[0]["id"] == job["session_id"]
+
+        resumed = core.get_client_session("client-alpha", job["resume_token"], job["session_id"])
+        assert resumed is not None
+        assert resumed["name"] == "Owned Session"
+
+        assert core.list_client_sessions("client-alpha", "wrong-token") == []
+        assert core.get_client_session("client-alpha", "wrong-token", job["session_id"]) is None
+
+        try:
+            core.create_job(
+                "bad attach",
+                "echo",
+                [{"n": 2}],
+                session_id=job["session_id"],
+                resume_token="wrong-token",
+            )
+        except core.CapabilityError as exc:
+            assert "resume token" in str(exc)
+        else:  # pragma: no cover
+            raise AssertionError("mismatched resume token should not attach")
+
+
+def test_expired_lease_recovery_requeues_and_ignores_late_result():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/recovery.db"
+        from taskgrid import core
+
+        job = core.create_job("recover lease", "echo", [{"n": 1}], max_retries=1)
+        task = core.lease_tasks("node-a", limit=1, lease_seconds=30, instance_id="instance-001")[0]
+        assert task["assigned_worker_id"] == "node-a-instance-001"
+
+        with core.connection() as conn:
+            conn.execute(
+                "UPDATE tasks SET lease_expires_at=? WHERE id=?",
+                ("2000-01-01T00:00:00+00:00", task["id"]),
+            )
+
+        status = core.recovery_status()
+        assert status["expired_running_tasks"] == 1
+        assert status["running_tasks"] == 1
+
+        recovered = core.recover_expired_leases(updated_by="test")
+        assert recovered["expired"] == 1
+        assert recovered["requeued"] == 1
+        recovered_task = core.get_task(task["id"])
+        assert recovered_task is not None
+        assert recovered_task["status"] == "queued"
+        assert recovered_task["assigned_worker_id"] is None
+
+        # A late result from the original executor must not revive or complete the task.
+        late = core.complete_task(task["id"], "node-a", {"too_late": True}, instance_id="instance-001")
+        assert late is not None
+        assert late["status"] == "queued"
+        ignored = core.list_events(entity_type="task", entity_id=task["id"], code="TaskResultIgnored")
+        assert ignored
+        assert ignored[0]["data"]["executor_id"] == "node-a-instance-001"
+
+
+def test_stale_worker_is_reported_in_recovery_status():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/stale-worker.db"
+        from taskgrid import core
+
+        core.heartbeat_worker("stale-node", metadata={"tags": ["cpu"], "task_types": ["echo"]})
+        with core.connection() as conn:
+            conn.execute(
+                "UPDATE workers SET last_heartbeat_at=? WHERE id=?",
+                ("2000-01-01T00:00:00+00:00", "stale-node"),
+            )
+        status = core.recovery_status(active_seconds=60)
+        assert status["workers_stale"] == 1
+        assert status["stale_workers"][0]["id"] == "stale-node"
+
+
+def test_purge_offline_workers_removes_stale_registry_rows_and_keeps_active():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/purge-workers.db"
+        from taskgrid import core
+
+        core.heartbeat_worker("active-node", metadata={"tags": ["cpu"], "task_types": ["echo"]})
+        core.heartbeat_worker("stale-node", metadata={"tags": ["old"], "task_types": ["echo"]})
+        core.set_worker_config("stale-node", 3, updated_by="test")
+        with core.connection() as conn:
+            conn.execute(
+                "UPDATE workers SET last_heartbeat_at=? WHERE id=?",
+                ("2000-01-01T00:00:00+00:00", "stale-node"),
+            )
+
+        summary = core.purge_offline_workers(active_seconds=60, updated_by="test")
+        assert summary["purged_count"] == 1
+        assert summary["purged_workers"][0]["id"] == "stale-node"
+        assert {worker["id"] for worker in core.list_workers()} == {"active-node"}
+        with core.connection() as conn:
+            assert conn.execute("SELECT COUNT(*) AS count FROM worker_configs WHERE worker_id=?", ("stale-node",)).fetchone()["count"] == 0
+        events = core.list_events(code="WorkerPurgedOffline", limit=10)
+        assert events and events[0]["entity_id"] == "stale-node"
+
+
+def test_purge_offline_workers_skips_running_assignments_by_default():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/purge-running-workers.db"
+        from taskgrid import core
+
+        job = core.create_job("running on stale", "echo", [{"n": 1}])
+        task = core.lease_tasks("stale-node", limit=1, instance_id="instance-001")[0]
+        assert task["assigned_worker_id"] == "stale-node-instance-001"
+        with core.connection() as conn:
+            conn.execute(
+                "UPDATE workers SET last_heartbeat_at=? WHERE id=?",
+                ("2000-01-01T00:00:00+00:00", "stale-node"),
+            )
+
+        summary = core.purge_offline_workers(active_seconds=60, updated_by="test")
+        assert summary["purged_count"] == 0
+        assert summary["skipped_count"] == 1
+        assert summary["skipped_workers"][0]["running_assignments"] == 1
+        assert core.get_worker("stale-node") is not None
+        assert core.get_task(task["id"])["status"] == "running"
+
+        forced = core.purge_offline_workers(active_seconds=60, include_running=True, updated_by="test")
+        assert forced["purged_count"] == 1
+        assert core.get_worker("stale-node") is None
+        assert core.get_task(task["id"])["status"] == "running"
+        assert core.get_job(job["id"])["status"] == "running"
+
+
+def test_batch_lease_assigns_distinct_instances_and_completes():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/batch.db"
+        from taskgrid import core
+
+        job = core.create_job("batch", "echo", [{"n": i} for i in range(4)])
+        core.heartbeat_worker("node-a", metadata={"task_types": ["echo"], "configured_instances": 4})
+        leased = core.lease_tasks_for_instances("node-a", ["instance-001", "instance-002", "instance-003"], lease_seconds=30)
+        assert len(leased) == 3
+        assert {item["assigned_worker_id"] for item in leased} == {
+            "node-a-instance-001",
+            "node-a-instance-002",
+            "node-a-instance-003",
+        }
+        for item in leased:
+            core.complete_task(item["id"], "node-a", {"ok": item["leased_instance_id"]}, instance_id=item["leased_instance_id"])
+        assert core.get_job(job["id"])["completed_tasks"] == 3
+
+
+def test_result_exports_json_csv_and_failed_only():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/exports.db"
+        from taskgrid import core
+
+        job = core.create_job("exports", "echo", [{"n": 1}, {"n": 2}], max_retries=0)
+        first, second = core.lease_tasks("node-a", limit=2)
+        core.complete_task(first["id"], "node-a", {"ok": True})
+        core.fail_task(second["id"], "node-a", "boom")
+
+        body, media, name = core.export_job_results(job["id"], fmt="json")
+        assert media.startswith("application/json")
+        assert name.endswith("results.json")
+        assert '"tasks"' in body
+
+        csv_body, csv_media, csv_name = core.export_job_results(job["id"], fmt="csv")
+        assert csv_media.startswith("text/csv")
+        assert "task_id,job_id" in csv_body
+        assert csv_name.endswith("results.csv")
+
+        failed_csv, _, failed_name = core.export_job_results(job["id"], fmt="csv", failed_only=True)
+        assert "boom" in failed_csv
+        assert first["id"] not in failed_csv
+        assert failed_name.endswith("failed-tasks.csv")
+
+
+def test_retention_preview_and_cleanup_terminal_sessions_only():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/retention.db"
+        from taskgrid import core
+
+        old = core.create_job("old", "echo", [{"n": 1}])
+        task = core.lease_tasks("node-a", limit=1)[0]
+        core.complete_task(task["id"], "node-a", {"ok": True})
+        live = core.create_job("live", "echo", [{"n": 2}])
+
+        with core.connection() as conn:
+            conn.execute("UPDATE service_sessions SET finished_at='2000-01-01T00:00:00.000+00:00' WHERE id=?", (old["session_id"],))
+            conn.execute("UPDATE jobs SET finished_at='2000-01-01T00:00:00.000+00:00' WHERE id=?", (old["id"],))
+
+        preview = core.retention_preview(completed_days=1, failed_days=1, event_days=3650)
+        assert preview["completed_or_cancelled_sessions"] >= 1
+        summary = core.apply_retention_cleanup(completed_days=1, failed_days=1, event_days=3650)
+        assert summary["deleted_sessions"] >= 1
+        assert core.get_session(old["session_id"]) is None
+        assert core.get_session(live["session_id"]) is not None
+
+
+def test_graceful_cancel_leaves_running_task_to_finish():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/graceful-cancel.db"
+        from taskgrid import core
+
+        job = core.create_job("cancel demo", "echo", [{"n": 1}, {"n": 2}])
+        task = core.lease_tasks("node-c", limit=1, instance_id="instance-001")[0]
+        cancelled = core.cancel_job(job["id"], mode="graceful")
+        assert cancelled is not None
+        assert cancelled["status"] == "cancelling"
+        statuses = {item["status"] for item in core.list_tasks(job["id"])}
+        assert statuses == {"running", "cancelled"}
+
+        completed = core.complete_task(task["id"], "node-c", {"ok": True}, instance_id="instance-001")
+        assert completed is not None
+        assert completed["status"] == "succeeded"
+        final = core.get_job(job["id"])
+        assert final is not None
+        assert final["status"] == "cancelled"
+        assert final["completed_tasks"] == 1
+        assert final["cancelled_tasks"] == 1
+
+
+def test_force_cancel_marks_running_task_cancelled():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/force-cancel.db"
+        from taskgrid import core
+
+        job = core.create_job("force cancel demo", "echo", [{"n": 1}, {"n": 2}])
+        core.lease_tasks("node-c", limit=1, instance_id="instance-001")
+        cancelled = core.cancel_job(job["id"], mode="force")
+        assert cancelled is not None
+        assert cancelled["status"] == "cancelled"
+        assert all(item["status"] == "cancelled" for item in core.list_tasks(job["id"]))
+
+
+def test_disabled_worker_does_not_receive_new_leases_and_can_be_reenabled():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/disabled-worker.db"
+        from taskgrid import core
+
+        core.heartbeat_worker("node-disable", metadata={"tags": ["cpu"], "task_types": ["echo"], "instance_count": 1})
+        job = core.create_job("disable demo", "echo", [{"n": 1}, {"n": 2}])
+
+        config = core.set_worker_enabled("node-disable", enabled=False, reason="maintenance", updated_by="test")
+        assert bool(config["disabled"])
+        assert core.lease_tasks("node-disable", limit=1, instance_id="instance-001") == []
+
+        worker = core.list_workers()[0]
+        assert worker["disabled"] is True
+        assert worker["disabled_reason"] == "maintenance"
+
+        config = core.set_worker_enabled("node-disable", enabled=True, updated_by="test")
+        assert not bool(config["disabled"])
+        leased = core.lease_tasks("node-disable", limit=1, instance_id="instance-001")
+        assert len(leased) == 1
+        assert leased[0]["job_id"] == job["id"]
+
+
+def test_bulk_worker_disable_prevents_batch_leases_for_selected_nodes():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/bulk-disabled-worker.db"
+        from taskgrid import core
+
+        core.heartbeat_worker("node-a", metadata={"task_types": ["echo"], "instance_count": 2})
+        core.heartbeat_worker("node-b", metadata={"task_types": ["echo"], "instance_count": 2})
+        core.create_job("bulk disable", "echo", [{"n": i} for i in range(4)])
+
+        summary = core.set_workers_enabled(["node-a", "node-b"], enabled=False, reason="pause", updated_by="test")
+        assert summary["count"] == 2
+        assert core.lease_tasks_for_instances("node-a", ["instance-001", "instance-002"]) == []
+        assert core.lease_tasks_for_instances("node-b", ["instance-001", "instance-002"]) == []
+
+        core.set_worker_enabled("node-b", enabled=True, updated_by="test")
+        leased = core.lease_tasks_for_instances("node-b", ["instance-001", "instance-002"])
+        assert len(leased) == 2
+        assert all(task["assigned_worker_id"].startswith("node-b-instance-") for task in leased)
+
+
+def test_disabled_worker_is_not_capable_for_strict_submit():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/disabled-capability.db"
+        from taskgrid import core
+
+        core.heartbeat_worker("node-cap", metadata={"task_types": ["echo"], "tags": ["cpu"], "instance_count": 1})
+        assert core.get_task_catalog(task_type="echo")["capable_workers"]
+        core.set_worker_enabled("node-cap", enabled=False, reason="pause", updated_by="test")
+        catalog = core.get_task_catalog(task_type="echo")
+        assert catalog["supporting_workers"]
+        assert not catalog["capable_workers"]
+        assert catalog["workers"][0]["disabled"] is True
+        try:
+            core.create_job("strict", "echo", [{"n": 1}], require_capable_worker=True)
+        except core.CapabilityError as exc:
+            assert "no active capable worker" in str(exc)
+        else:
+            raise AssertionError("strict submit should fail when only supporting worker is disabled")
+
+def test_paused_session_blocks_new_leases_until_resumed():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/pause-session.db"
+        from taskgrid import core
+
+        job = core.create_job("pause session", "echo", [{"n": 1}, {"n": 2}])
+        paused = core.set_session_paused(job["session_id"], True, reason="maintenance", updated_by="test")
+        assert paused is not None
+        assert int(paused["paused"]) == 1
+        assert core.lease_tasks("node-a", limit=1) == []
+        assert all(task["status"] == "queued" for task in core.list_tasks(job["id"]))
+
+        resumed = core.set_session_paused(job["session_id"], False, updated_by="test")
+        assert resumed is not None
+        assert int(resumed["paused"]) == 0
+        leased = core.lease_tasks("node-a", limit=1)
+        assert len(leased) == 1
+        assert leased[0]["job_id"] == job["id"]
+
+
+def test_paused_job_blocks_leasing_without_pausing_whole_session():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/pause-job.db"
+        from taskgrid import core
+
+        first = core.create_job("paused job", "echo", [{"n": 1}], session_name="pause mix")
+        second = core.create_job("active job", "echo", [{"n": 2}], session_id=first["session_id"], resume_token=first["resume_token"])
+        paused = core.set_job_paused(first["id"], True, reason="hold", updated_by="test")
+        assert paused is not None
+        assert int(paused["paused"]) == 1
+
+        leased = core.lease_tasks("node-a", limit=2)
+        assert len(leased) == 1
+        assert leased[0]["job_id"] == second["id"]
+
+        core.set_job_paused(first["id"], False, updated_by="test")
+        leased_again = core.lease_tasks("node-a", limit=1)
+        assert len(leased_again) == 1
+        assert leased_again[0]["job_id"] == first["id"]

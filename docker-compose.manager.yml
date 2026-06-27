@@ -19,6 +19,10 @@ services:
     environment:
       TASKGRID_DB: /data/taskgrid.db
       TASKGRID_MANAGER_LOG: /data/manager.log
+      TASKGRID_ADMIN_TOKEN: ${TASKGRID_ADMIN_TOKEN:-}
+      TASKGRID_CLIENT_TOKEN: ${TASKGRID_CLIENT_TOKEN:-}
+      TASKGRID_WORKER_TOKEN: ${TASKGRID_WORKER_TOKEN:-}
+      TASKGRID_UI_TOKEN: ${TASKGRID_UI_TOKEN:-}
       PYTHONUNBUFFERED: "1"
     ports:
       - "8000:8000"

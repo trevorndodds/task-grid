@@ -20,6 +20,10 @@ services:
     environment:
       TASKGRID_DB: /data/taskgrid.db
       TASKGRID_MANAGER_LOG: /data/manager.log
+      TASKGRID_ADMIN_TOKEN: ${TASKGRID_ADMIN_TOKEN:-}
+      TASKGRID_CLIENT_TOKEN: ${TASKGRID_CLIENT_TOKEN:-}
+      TASKGRID_WORKER_TOKEN: ${TASKGRID_WORKER_TOKEN:-}
+      TASKGRID_UI_TOKEN: ${TASKGRID_UI_TOKEN:-}
       PYTHONUNBUFFERED: "1"
     ports:
       - "8000:8000"
@@ -40,6 +44,7 @@ services:
     command: >
       python -m taskgrid.worker
       --broker http://manager:8000
+      --worker-token ${TASKGRID_WORKER_TOKEN:-}
       --worker-id risk-node-1
       --module examples.custom_tasks
       --service-name risk-worker
@@ -48,6 +53,9 @@ services:
       --poll-seconds ${POLL_SECONDS:-1.0}
       --heartbeat-seconds ${HEARTBEAT_SECONDS:-2.0}
       --broker-pool-size ${BROKER_POOL_SIZE:-4}
+      --batch-lease-size ${BATCH_LEASE_SIZE:-1}
+      --long-poll-seconds ${LONG_POLL_SECONDS:-0}
+      --execution-mode ${EXECUTION_MODE:-process}
       --log-root /logs
       --log-api-host 0.0.0.0
       --log-api-port 9201
@@ -67,6 +75,7 @@ services:
     command: >
       python -m taskgrid.worker
       --broker http://manager:8000
+      --worker-token ${TASKGRID_WORKER_TOKEN:-}
       --worker-id pricing-node-1
       --module examples.custom_tasks
       --service-name pricing-worker
@@ -75,6 +84,9 @@ services:
       --poll-seconds ${POLL_SECONDS:-1.0}
       --heartbeat-seconds ${HEARTBEAT_SECONDS:-2.0}
       --broker-pool-size ${BROKER_POOL_SIZE:-4}
+      --batch-lease-size ${BATCH_LEASE_SIZE:-1}
+      --long-poll-seconds ${LONG_POLL_SECONDS:-0}
+      --execution-mode ${EXECUTION_MODE:-process}
       --log-root /logs
       --log-api-host 0.0.0.0
       --log-api-port 9201
