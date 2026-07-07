@@ -29,7 +29,7 @@ from requests.adapters import HTTPAdapter
 
 from .tasks import list_task_types, load_modules, run_task
 
-VERSION = "0.21.0"
+VERSION = "0.29.0"
 MAX_INSTANCES = 128
 MAX_LOG_TAIL_BYTES = 1_000_000
 MAX_EMBEDDED_TASK_OUTPUT_BYTES = 250_000

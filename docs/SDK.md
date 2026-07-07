@@ -139,7 +139,13 @@ results = client.results(job["id"], order="input")
 
 ```python
 session_results = client.session_results(job["session_id"], order="input")
+assignments = client.session_assignments(job["session_id"])
+
+# Finished-session/task audit drilldown.
+history = client.session_task_history(job["session_id"], status="failed")
 ```
+
+`session_assignments(...)` returns the same live assignment drilldown used by the Session UI: running tasks by worker instance, worker/instance rollups, task status counts, and task/job/session mapping.
 
 Result entries include `input_index`, `input_key`, payload, result/error, status, assigned worker instance, attempts, and timing. `order="input"` is the default and remains deterministic even when tasks finish out of order. `order` can also be `started`, `completed`, or `status`.
 
@@ -161,6 +167,16 @@ for event in client.stream_session_results(job["session_id"], replay=True):
 ```
 
 Streams use Server-Sent Events underneath and yield decoded dictionaries. The `_event` key contains `progress`, `result`, `done`, or `timeout`. `replay=True` is the default, so terminal results that finished before the client connected are sent first.
+
+
+## Queue diagnostics
+
+```python
+diag = client.queue_diagnostics(limit=1000)
+print(diag["reason_counts"])
+```
+
+`queue_diagnostics(...)` returns the same backlog explanation used by `/ui/queue`. It is useful when a client has submitted work but tasks remain queued. Reasons include paused sessions/jobs, missing task type support, missing required tags, disabled/draining/stale workers, and all capable workers being busy.
 
 ## Jobs
 
@@ -280,6 +296,20 @@ Behavior:
 - new jobs attached to the session inherit the session priority unless overridden
 ```
 
+## Executor instance dashboard
+
+Use the executor helpers for the manager-wide instance view. This is separate from `session_assignments(...)`, which only shows tasks belonging to one session.
+
+```python
+summary = client.executors()
+for slot in summary["instances"]:
+    print(slot["worker_id"], slot["instance_id"], slot["state"], slot.get("current_task"))
+
+detail = client.executor("node-a", "instance-001", recent_limit=100)
+print(detail["current_task"])
+print(detail["recent_tasks"])
+```
+
 ## Workers
 
 List workers:
@@ -310,7 +340,16 @@ client.disable_workers(["node-a", "node-b"], reason="maintenance window")
 client.enable_workers(["node-a", "node-b"])
 ```
 
-Disabled workers do not receive new leases. Running tasks are allowed to finish, and the manager keeps task history/results/log references.
+Drain a worker without scaling the supervisor down, or drain one logical instance slot:
+
+```python
+client.drain_worker("node-a", reason="maintenance")
+client.undrain_worker("node-a")
+client.drain_worker_instance("node-a", "instance-003", reason="slot investigation")
+client.undrain_worker_instance("node-a", "instance-003")
+```
+
+Disabled and drained workers do not receive new leases. Running tasks are allowed to finish, and the manager keeps task history/results/log references. Use disable when the node should scale local instance loops down to zero; use drain when the node should stay up but stop receiving new work.
 
 Backwards-compatible alias:
 
@@ -423,6 +462,10 @@ client.set_worker_instances(worker_id, desired_instances)
 client.set_worker_concurrency(worker_id, desired_concurrency)  # alias
 client.disable_worker(worker_id, reason=None)
 client.enable_worker(worker_id, reason=None)
+client.drain_worker(worker_id, reason=None)
+client.undrain_worker(worker_id, reason=None)
+client.drain_worker_instance(worker_id, instance_id, reason=None)
+client.undrain_worker_instance(worker_id, instance_id)
 client.disable_workers(worker_ids, reason=None)
 client.enable_workers(worker_ids, reason=None)
 client.set_workers_disabled(worker_ids, disabled, reason=None)
@@ -468,3 +511,58 @@ summary = client.apply_retention_cleanup(completed_days=30, failed_days=90, even
 ```
 
 Cleanup only removes terminal sessions/jobs/tasks older than the selected windows. Running and queued work is preserved.
+
+
+## Service registry
+
+Workers advertise service/application metadata through heartbeat fields such as `service_name`, `service_version`, task types, and tags. The SDK can read the manager's derived registry:
+
+```python
+services = client.services()
+current = client.services(service_name="risk-engine", service_version="1.2.0")
+```
+
+Each service summary includes active/total/stale/disabled/draining worker counts, desired and active instances, running task count, task types, tags, TaskGrid package versions, and the worker IDs currently advertising that service version.
+
+
+### Session task history
+
+Use `client.session_task_history(...)` when a finished session needs task-by-task drilldown. It is history-focused and separate from `client.session_assignments(...)`, which is optimized for current live placement.
+
+
+## Bulk task actions
+
+Use bulk task actions when a drilldown or diagnostic view identifies a set of tasks that should be retried or cancelled.
+
+```python
+client.retry_session_tasks(session_id, statuses=["failed", "cancelled"])
+client.cancel_session_tasks(session_id, statuses=["queued"])
+client.cancel_session_tasks(session_id, statuses=["running"], include_running=True)
+
+client.retry_job_tasks(job_id)
+client.cancel_job_tasks(job_id, statuses=["queued"])
+
+client.bulk_task_action(
+    "retry",
+    session_id=session_id,
+    statuses=["failed"],
+    reset_attempts=True,
+    limit=5000,
+)
+```
+
+Force-cancelling running tasks marks them cancelled immediately and preserves the executor assignment for history. If the old worker later posts a completion, TaskGrid ignores that late result.
+
+
+
+## Operator snapshot refresh
+
+The heavier operator helpers accept `refresh=True` to bypass TaskGrid's short in-process dashboard cache:
+
+```python
+client.queue_diagnostics(refresh=True)
+client.executors(refresh=True)
+client.services(refresh=True)
+```
+
+Without `refresh=True`, these calls may return a snapshot from the last few hundred milliseconds. The response includes `cached`, `cache_age_ms`, and `cache_ttl_ms`.

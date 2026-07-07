@@ -1,5 +1,77 @@
 # Changelog
 
+## 0.32.0 - Operator endpoint caching and lease-path optimization
+
+- Added a short-lived operator snapshot cache for heavy read endpoints: `/queue/diagnostics`, `/executors`, and `/services`.
+- Added `refresh=true` query support plus SDK `refresh=True` parameters for those endpoints.
+- Returned cache metadata (`cached`, `cache_age_ms`, `cache_ttl_ms`) so operators can see when a dashboard response was reused.
+- Removed the per-task post-lease SELECT in single and batch lease paths; leased task responses are now built from the selected candidate row plus known lease fields.
+- Throttled opportunistic expired-lease recovery during high-volume lease polling with `TASKGRID_LEASE_RECOVERY_INTERVAL_MS` while keeping explicit maintenance recovery immediate.
+- Added SQLite indexes for executor recent-task history and queue-order scans.
+- Added tests for operator snapshot caching and optimized batch lease response shape.
+## 0.31.0 - Bulk task actions from drilldowns
+
+- Added bounded bulk task actions so session/job/history drilldowns can retry or cancel selected task sets.
+- Added `POST /tasks/bulk-action`, `POST /sessions/{session_id}/tasks/bulk-action`, and `POST /jobs/{job_id}/tasks/bulk-action`.
+- Added SDK helpers for bulk task action, retrying session/job tasks, and cancelling queued or running task sets.
+- Added Session Task History controls for retrying failed/cancelled tasks, cancelling queued tasks, and force-cancelling running tasks.
+- Force-cancelled running tasks preserve their executor assignment for durable history, and late worker completions remain ignored safely.
+- Added tests for bulk retry, queued cancellation, force running cancellation, API, UI controls, and late result safety.
+
+## 0.30.0 - Queue diagnostics and schedulability visibility
+
+- Added queue/backlog diagnostics so operators can see why queued tasks are not leasing.
+- Added `GET /queue/diagnostics` with reason counts, task-type/session/job rollups, task-level details, and worker capacity snapshots.
+- Added `/ui/queue` with leaseable/blocked counts, blocker reasons, queued task detail, and worker slot estimates.
+- Added SDK helper `client.queue_diagnostics(...)`.
+- Diagnostics explain paused sessions/jobs, missing task type support, missing required tags, disabled/draining/stale workers, and busy capable workers.
+
+## 0.29.0 - Finished session task history drilldown
+
+- Added durable session task history API at `GET /sessions/{session_id}/tasks/history`.
+- Added SDK helper `client.session_task_history(...)`.
+- Added Session UI **Task History** drilldown for finished and active sessions.
+- History view shows every task in the session, final worker/instance slot, job mapping, input index/key, attempts, runtime, payload/result sizes, and result/error preview.
+- Added status/job/order/limit filters for session task history.
+- Preserved final executor assignment for terminal failed tasks so failure history shows which instance produced the final error.
+- Added tests for finished session history API/UI and live SDK usage.
+
+## 0.28.0 - Global executor instance dashboard
+
+- Added manager-wide executor/instance dashboard separate from session-scoped assignment drilldown.
+- Added `GET /executors` for all known worker slots with state, service version, current task, session/job, drain/disabled/stale status, and log path.
+- Added `GET /executors/{worker_id}/instances/{instance_id}` for one execution slot with current assignment and recent task history.
+- Added `/ui/executors` and per-instance detail pages with links to task, job, session, worker, and instance logs.
+- Added SDK helpers `client.executors(...)` and `client.executor(...)`.
+- Session drilldown remains scoped to tasks from that session only.
+- Bumped worker-advertised TaskGrid version to `0.28.0`.
+
+## 0.27.0 - Session assignment drilldown
+
+- Added session-scoped assignment summaries so operators can see which worker instances are running tasks for a service session.
+- Added `GET /sessions/{session_id}/assignments` with status counts, running assignments, worker/instance rollups, and task assignment rows.
+- Updated the Session UI to show live running assignments, worker/instance stats, and task drilldown without jumping to raw result exports.
+- Added SDK helper `client.session_assignments(...)`.
+- Added tests for assignment summaries, API/SDK access, and Session UI visibility.
+
+## 0.26.0 - Service registry and version visibility
+
+- Added a derived service registry grouped by worker-advertised service name and service version.
+- Added `GET /services` with optional `service_name` and `service_version` filters.
+- Added `/ui/services` for spotting mixed Docker image/service versions, stale workers, disabled/draining workers, and task types by service.
+- Added SDK helper `client.services(...)`.
+- Service summaries include worker counts, desired/active instances, running tasks, task types, tags, TaskGrid versions, and worker membership.
+- Added core/API/UI/live SDK tests for service version aggregation.
+
+## 0.25.0 - Worker drain lifecycle controls
+
+- Added worker drain mode for graceful maintenance: running tasks may finish, but the manager stops issuing new leases to the drained node.
+- Added per-instance drain controls so one execution slot can be held out of scheduling while sibling instances continue to lease work.
+- Drain is distinct from disable: disable still tells heartbeating workers to scale local instance loops down to zero; drain only blocks manager scheduling.
+- Added API and SDK helpers for draining/clearing worker and instance drains.
+- Updated Workers UI with drain/clear-drain controls and drained-instance visibility.
+- Added tests for worker drain, instance drain, strict capability checks, and live SDK/API drain behavior.
+
 ## 0.24.2 - Idempotent submission and failure recovery smoke tests
 
 - Added optional `idempotency_key` on job submission so clients can safely retry after a manager crash or lost HTTP response without creating duplicate jobs.

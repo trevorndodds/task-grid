@@ -135,6 +135,10 @@ def init_db() -> None:
                 ON tasks(status, lease_expires_at);
             CREATE INDEX IF NOT EXISTS idx_tasks_assigned
                 ON tasks(status, assigned_worker_id);
+            CREATE INDEX IF NOT EXISTS idx_tasks_assigned_history
+                ON tasks(assigned_worker_id, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_tasks_queue_order
+                ON tasks(status, priority DESC, created_at ASC, input_index ASC, id ASC);
             CREATE INDEX IF NOT EXISTS idx_tasks_finished
                 ON tasks(job_id, finished_at);
             CREATE INDEX IF NOT EXISTS idx_tasks_status_updated
@@ -159,8 +163,22 @@ def init_db() -> None:
                 disabled INTEGER NOT NULL DEFAULT 0,
                 disabled_at TEXT,
                 disabled_reason TEXT,
+                draining INTEGER NOT NULL DEFAULT 0,
+                drain_at TEXT,
+                drain_reason TEXT,
                 updated_at TEXT NOT NULL,
                 updated_by TEXT NOT NULL DEFAULT 'system'
+            );
+
+            CREATE TABLE IF NOT EXISTS worker_instance_configs (
+                worker_id TEXT NOT NULL,
+                instance_id TEXT NOT NULL,
+                draining INTEGER NOT NULL DEFAULT 0,
+                drain_at TEXT,
+                drain_reason TEXT,
+                updated_at TEXT NOT NULL,
+                updated_by TEXT NOT NULL DEFAULT 'system',
+                PRIMARY KEY(worker_id, instance_id)
             );
 
             CREATE TABLE IF NOT EXISTS events (
@@ -253,8 +271,30 @@ def init_db() -> None:
             conn.execute("ALTER TABLE worker_configs ADD COLUMN disabled_at TEXT")
         if "disabled_reason" not in worker_config_columns:
             conn.execute("ALTER TABLE worker_configs ADD COLUMN disabled_reason TEXT")
+        if "draining" not in worker_config_columns:
+            conn.execute("ALTER TABLE worker_configs ADD COLUMN draining INTEGER NOT NULL DEFAULT 0")
+        if "drain_at" not in worker_config_columns:
+            conn.execute("ALTER TABLE worker_configs ADD COLUMN drain_at TEXT")
+        if "drain_reason" not in worker_config_columns:
+            conn.execute("ALTER TABLE worker_configs ADD COLUMN drain_reason TEXT")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS worker_instance_configs (
+                worker_id TEXT NOT NULL,
+                instance_id TEXT NOT NULL,
+                draining INTEGER NOT NULL DEFAULT 0,
+                drain_at TEXT,
+                drain_reason TEXT,
+                updated_at TEXT NOT NULL,
+                updated_by TEXT NOT NULL DEFAULT 'system',
+                PRIMARY KEY(worker_id, instance_id)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_worker_instance_configs_state ON worker_instance_configs(worker_id, draining)")
 
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_assigned ON tasks(status, assigned_worker_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_finished ON tasks(job_id, finished_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_status_updated ON tasks(status, updated_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_assigned_history ON tasks(assigned_worker_id, updated_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_queue_order ON tasks(status, priority DESC, created_at ASC, input_index ASC, id ASC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_input_order ON tasks(job_id, input_index, id)")

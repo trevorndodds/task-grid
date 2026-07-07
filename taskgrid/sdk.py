@@ -174,6 +174,24 @@ class TaskGridClient:
     def session_jobs(self, session_id: str) -> list[dict[str, Any]]:
         return self._request("GET", f"/sessions/{session_id}/jobs")
 
+    def session_assignments(self, session_id: str, limit: int = 1000) -> dict[str, Any]:
+        return self._request("GET", f"/sessions/{session_id}/assignments?{parse.urlencode({'limit': limit})}")
+
+    def session_task_history(
+        self,
+        session_id: str,
+        limit: int = 5000,
+        status: str | None = None,
+        job_id: str | None = None,
+        order: str = "input",
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"limit": limit, "order": order}
+        if status:
+            params["status"] = status
+        if job_id:
+            params["job_id"] = job_id
+        return self._request("GET", f"/sessions/{parse.quote(session_id, safe='')}/tasks/history?{parse.urlencode(params)}")
+
     def session_results(self, session_id: str, order: str = "input") -> dict[str, Any]:
         return self._request("GET", f"/sessions/{session_id}/results?{parse.urlencode({'order': order})}")
 
@@ -239,6 +257,102 @@ class TaskGridClient:
         return self._request("POST", f"/tasks/{task_id}/retry?reset_attempts={suffix}", {})
 
 
+    def bulk_task_action(
+        self,
+        action: str,
+        *,
+        session_id: str | None = None,
+        job_id: str | None = None,
+        task_ids: list[str] | None = None,
+        statuses: list[str] | None = None,
+        reset_attempts: bool = True,
+        include_running: bool = False,
+        limit: int = 5000,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "action": action,
+            "reset_attempts": bool(reset_attempts),
+            "include_running": bool(include_running),
+            "limit": int(limit),
+        }
+        if session_id:
+            payload["session_id"] = session_id
+        if job_id:
+            payload["job_id"] = job_id
+        if task_ids:
+            payload["task_ids"] = task_ids
+        if statuses:
+            payload["statuses"] = statuses
+        return self._request("POST", "/tasks/bulk-action", payload)
+
+    def retry_session_tasks(
+        self,
+        session_id: str,
+        statuses: list[str] | None = None,
+        reset_attempts: bool = True,
+        limit: int = 5000,
+    ) -> dict[str, Any]:
+        return self.bulk_task_action(
+            "retry",
+            session_id=session_id,
+            statuses=statuses or ["failed", "cancelled"],
+            reset_attempts=reset_attempts,
+            limit=limit,
+        )
+
+    def cancel_session_tasks(
+        self,
+        session_id: str,
+        statuses: list[str] | None = None,
+        include_running: bool = False,
+        limit: int = 5000,
+    ) -> dict[str, Any]:
+        return self.bulk_task_action(
+            "cancel",
+            session_id=session_id,
+            statuses=statuses or ["queued"],
+            include_running=include_running,
+            limit=limit,
+        )
+
+    def retry_job_tasks(
+        self,
+        job_id: str,
+        statuses: list[str] | None = None,
+        reset_attempts: bool = True,
+        limit: int = 5000,
+    ) -> dict[str, Any]:
+        return self.bulk_task_action(
+            "retry",
+            job_id=job_id,
+            statuses=statuses or ["failed", "cancelled"],
+            reset_attempts=reset_attempts,
+            limit=limit,
+        )
+
+    def cancel_job_tasks(
+        self,
+        job_id: str,
+        statuses: list[str] | None = None,
+        include_running: bool = False,
+        limit: int = 5000,
+    ) -> dict[str, Any]:
+        return self.bulk_task_action(
+            "cancel",
+            job_id=job_id,
+            statuses=statuses or ["queued"],
+            include_running=include_running,
+            limit=limit,
+        )
+
+    def queue_diagnostics(self, limit: int = 1000, active_seconds: int | None = None, refresh: bool = False) -> dict[str, Any]:
+        params: dict[str, Any] = {"limit": int(limit)}
+        if active_seconds is not None:
+            params["active_seconds"] = int(active_seconds)
+        if refresh:
+            params["refresh"] = "true"
+        return self._request("GET", f"/queue/diagnostics?{parse.urlencode(params)}")
+
     def task_catalog(self, task_type: str | None = None, required_tags: list[str] | None = None) -> dict[str, Any]:
         params = []
         if task_type:
@@ -252,6 +366,29 @@ class TaskGridClient:
 
     def workers(self) -> list[dict[str, Any]]:
         return self._request("GET", "/workers")
+
+    def services(self, service_name: str | None = None, service_version: str | None = None, refresh: bool = False) -> dict[str, Any]:
+        params = []
+        if service_name:
+            params.append(("service_name", service_name))
+        if service_version:
+            params.append(("service_version", service_version))
+        if refresh:
+            params.append(("refresh", "true"))
+        query = "?" + parse.urlencode(params) if params else ""
+        return self._request("GET", f"/services{query}")
+
+    def executors(self, limit: int = 1000, active_seconds: int | None = None, refresh: bool = False) -> dict[str, Any]:
+        params = [("limit", str(int(limit)))]
+        if active_seconds is not None:
+            params.append(("active_seconds", str(int(active_seconds))))
+        if refresh:
+            params.append(("refresh", "true"))
+        return self._request("GET", f"/executors?{parse.urlencode(params)}")
+
+    def executor(self, worker_id: str, instance_id: str, recent_limit: int = 100) -> dict[str, Any]:
+        params = parse.urlencode({"recent_limit": int(recent_limit)})
+        return self._request("GET", f"/executors/{parse.quote(worker_id, safe='')}/instances/{parse.quote(instance_id, safe='')}?{params}")
 
     def worker_config(self, worker_id: str) -> dict[str, Any]:
         return self._request("GET", f"/workers/{worker_id}/config")
@@ -269,6 +406,18 @@ class TaskGridClient:
 
     def enable_worker(self, worker_id: str, reason: str | None = None) -> dict[str, Any]:
         return self._request("POST", f"/workers/{worker_id}/enable", {"reason": reason})
+
+    def drain_worker(self, worker_id: str, reason: str | None = None) -> dict[str, Any]:
+        return self._request("POST", f"/workers/{worker_id}/drain", {"reason": reason})
+
+    def undrain_worker(self, worker_id: str, reason: str | None = None) -> dict[str, Any]:
+        return self._request("POST", f"/workers/{worker_id}/undrain", {"reason": reason})
+
+    def drain_worker_instance(self, worker_id: str, instance_id: str, reason: str | None = None) -> dict[str, Any]:
+        return self._request("POST", f"/workers/{worker_id}/instances/{parse.quote(instance_id, safe='')}/drain", {"reason": reason})
+
+    def undrain_worker_instance(self, worker_id: str, instance_id: str, reason: str | None = None) -> dict[str, Any]:
+        return self._request("POST", f"/workers/{worker_id}/instances/{parse.quote(instance_id, safe='')}/undrain", {"reason": reason})
 
     def set_workers_disabled(self, worker_ids: list[str], disabled: bool, reason: str | None = None) -> dict[str, Any]:
         return self._request("POST", "/workers/bulk-state", {"worker_ids": worker_ids, "disabled": disabled, "reason": reason})

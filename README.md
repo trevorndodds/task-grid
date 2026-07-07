@@ -47,10 +47,12 @@ TaskGrid separates scheduling holds from cancellation:
 Pause session/job   -> queued work stays queued, no new leases are issued
 Resume session/job  -> queued work becomes eligible again
 Cancel job          -> queued work is cancelled; running work may finish gracefully
-Disable worker      -> node keeps history/logs but receives no new leases
+Disable worker      -> node keeps history/logs but receives no new leases and local instances scale down
+Drain worker        -> node keeps instances configured, running work finishes, no new leases are issued
+Drain instance      -> one execution slot is held out of scheduling while siblings continue
 ```
 
-Pause is useful when a client run should wait behind maintenance, investigation, or a priority decision. It does not delete results, cancel running work, or reset attempts.
+Pause is useful when a client run should wait behind maintenance, investigation, or a priority decision. It does not delete results, cancel running work, or reset attempts. Drain is useful for graceful worker maintenance when you want the manager to stop assigning new work without tearing down the worker supervisor or its idle instances.
 
 ## Architecture
 
@@ -238,6 +240,7 @@ The MVP now includes a simple web UI with no frontend build system:
 /ui/jobs/{job_id}/results job-level task results view
 /ui/tasks/{task_id}       task payload/result/error detail and retry button
 /ui/workers               worker heartbeat/status list plus per-node instance-count config
+/ui/services              service/version registry derived from worker heartbeats
 /ui/workers/{id}/logs     worker log file list proxied through the broker
 /ui/manager/data-flow     manager-side client → broker → worker → result flow explanation
 /ui/submit                submit a job from the browser
@@ -713,6 +716,8 @@ print(client.results(job["id"]))
 
 Each submitted payload is stored with a durable `input_index` and optional `input_key`. Pass `input_keys` when the client already has stable row IDs; otherwise TaskGrid derives a key from payload `id`, `input_key`, or `key` when present. Result APIs and CSV/JSON exports default to `order=input`, so clients can map results back to their original input list even when workers complete tasks out of order.
 
+Session drilldown also exposes assignment state. Open `/ui/sessions/{session_id}` or call `GET /sessions/{session_id}/assignments` to see current running tasks by worker instance, per-worker/per-instance counts, queued/running/final task status, and task-to-job/session mapping.
+
 For crash-safe submit retries, pass a stable `client_id` and `idempotency_key`. If the manager commits a job but the client loses the response, retrying with the same key returns the original durable job instead of creating a duplicate. The SDK helper `client.new_idempotency_key(...)` creates a suitable key.
 
 Client reconnect uses `client.reconnect_session(session_id)` with the stored `client_id` and `resume_token`. Session scheduling control uses `client.pause_session(...)` and `client.resume_session(...)`, so reconnect and unpause are no longer overloaded in the SDK.
@@ -746,6 +751,7 @@ GET  /clients/{client_id}/sessions
 GET  /clients/{client_id}/sessions/{session_id}
 POST /sessions/{session_id}/priority
 GET  /sessions/{session_id}/jobs
+GET  /sessions/{session_id}/assignments
 GET  /sessions/{session_id}/results
 GET  /sessions/{session_id}/results/stream
 GET  /jobs
@@ -756,6 +762,8 @@ GET  /jobs/{job_id}/results/stream
 POST /jobs/{job_id}/cancel
 POST /jobs/{job_id}/retry-failed
 GET  /workers
+GET  /queue/diagnostics
+GET  /services
 GET  /workers/{worker_id}/logs
 GET  /workers/{worker_id}/logs/{filename}
 GET  /workers/{worker_id}/config
@@ -774,6 +782,7 @@ POST /ui/jobs/{job_id}/retry-failed
 GET  /ui/tasks/{task_id}
 POST /ui/tasks/{task_id}/retry
 GET  /ui/workers
+GET  /ui/queue
 POST /ui/workers/purge-offline
 GET  /ui/workers/{worker_id}/logs
 GET  /ui/workers/{worker_id}/logs/{filename}
@@ -810,15 +819,64 @@ Programmatic endpoints are also available:
 GET  /maintenance/status
 POST /maintenance/reconcile
 POST /maintenance/recover
+POST /workers/{worker_id}/drain
+POST /workers/{worker_id}/undrain
+POST /workers/{worker_id}/instances/{instance_id}/drain
+POST /workers/{worker_id}/instances/{instance_id}/undrain
 POST /workers/purge-offline
 ```
 
 `POST /maintenance/reconcile` is the normal operator-safe repair action. It recomputes job and service-session counters/statuses from durable task rows and, by default, recovers expired leases. The manager also runs this safe reconcile pass on startup so a restart repairs stale derived state without touching valid running leases.
 
+### Operator dashboard caching
+
+High-cardinality dashboard endpoints can be read many times while the manager is actively leasing and completing tasks. TaskGrid now keeps a short in-process snapshot cache for:
+
+```text
+GET /queue/diagnostics
+GET /executors
+GET /services
+```
+
+The default TTL is 500 ms and can be tuned with:
+
+```bash
+export TASKGRID_OPERATOR_CACHE_TTL_MS=500
+```
+
+Responses include `cached`, `cache_age_ms`, and `cache_ttl_ms`. Add `refresh=true` when an operator action needs a fresh read immediately. High-volume task lease/complete traffic does not invalidate the cache on every task, which keeps these pages from adding avoidable read pressure during tiny-task bursts.
+
+Lease polling also throttles opportunistic expired-lease recovery checks with `TASKGRID_LEASE_RECOVERY_INTERVAL_MS` defaulting to 500 ms. Explicit recovery and reconcile calls still run immediately.
+
 Late or duplicate results from an old worker are ignored and recorded with manager events such as `TaskResultIgnored` or `TaskFailureIgnored`.
 
 Offline workers stay in the manager registry after their last heartbeat so operators can see what disappeared. They can be purged from `/ui/workers`, `/ui/manager/recovery`, or `POST /workers/purge-offline`. Purging removes stale worker/config rows only; jobs, tasks, results, events, and remote worker logs are preserved. Workers with running task assignments are skipped by default.
 
+
+### Queue diagnostics
+
+The manager can explain queued backlog from the operator side:
+
+```text
+/ui/queue
+GET /queue/diagnostics
+```
+
+Queue diagnostics are separate from task/session history. They focus on tasks still in `queued` state and classify why they are or are not leaseable right now:
+
+```text
+leaseable_now
+session_paused
+job_paused
+no_worker_supports_task_type
+missing_required_tags
+all_capable_workers_disabled
+all_capable_workers_draining
+all_capable_workers_stale
+all_capable_workers_busy
+```
+
+The UI includes reason counts, task-type/session/job rollups, task-level detail, and a worker capacity snapshot with estimated free slots. This is useful when a session appears stuck but logs are quiet because no worker is eligible to lease the pending work.
 
 ### Worker capacity and instance control
 
@@ -834,6 +892,9 @@ Offline workers stay in the manager registry after their last heartbeat so opera
 - Workers can advertise tags with `python -m taskgrid.worker --tag gpu --tag risk-model-v2`.
 - Jobs can set `metadata.required_tags`, so only matching workers lease those tasks.
 - Workers also advertise loaded task types, service name, service version, tags, modules, and instance state.
+- `/ui/services` groups workers by advertised service name/version so operators can see mixed Docker image rollouts, stale versions, disabled/draining workers, and task ownership.
+- `/ui/sessions/{session_id}` includes live assignment stats showing what worker instance is running which task/job for that session.
+- `GET /services?service_name=risk-engine` returns the same service registry data for clients and automation.
 - `/ui/task-catalog` shows which active workers can run each task type.
 - `GET /task-catalog?task_type=square` returns task capability data for API clients.
 - Submissions can set `require_capable_worker=true` to reject work when no active capable worker is online.
@@ -945,6 +1006,64 @@ python scripts/benchmark_manager_connections.py \
 See `docs/SCALE.md` for current benchmark results and bottleneck notes.
 
 
+
+## Executor instance dashboard
+
+TaskGrid exposes a global execution-slot view for operators who need to see what every worker instance is doing right now. This is intentionally separate from the session assignment drilldown: session pages only show tasks in that session, while the executor dashboard shows every known worker instance across the manager.
+
+Useful endpoints:
+
+```text
+GET /executors
+GET /executors/{worker_id}/instances/{instance_id}
+```
+
+The web UI is available at:
+
+```text
+/ui/executors
+/ui/executors/{worker_id}/instances/{instance_id}
+```
+
+Each slot shows worker ID, instance ID, state, service name/version, TaskGrid worker version, advertised worker status, current task, session/job links, drain status, last poll, completion counter, and the instance log path such as `instances/instance-001/worker.log`.
+
+Python SDK:
+
+```python
+summary = client.executors()
+detail = client.executor("node-a", "instance-001")
+```
+
+## Session task history
+
+Finished sessions remain clickable and drillable. Use the session page **Task History** action, or call:
+
+```text
+GET /sessions/{session_id}/tasks/history
+```
+
+This is different from the session assignment drilldown. Assignments answer “what is running now in this session?” Task history answers “what happened to every task in this session?” It includes job mapping, input index/key, final worker/instance slot, attempts, timing, payload/result sizes, and result/error preview. Filters include `status`, `job_id`, `order`, and `limit`.
+
+Python SDK:
+
+```python
+history = client.session_task_history(session_id, status="failed")
+for task in history["tasks"]:
+    print(task["input_key"], task["status"], task["worker_id"], task["instance_id"])
+```
+
+
+## Bulk task actions
+
+Session and job drilldowns can now be used as operator control surfaces, not just read-only diagnostics. From the Session Task History page, operators can:
+
+```text
+Retry failed/cancelled tasks  -> requeue selected terminal failures
+Cancel queued tasks           -> cancel backlog without touching running work
+Force-cancel running tasks    -> mark running tasks cancelled and ignore late results
+```
+
+The same controls are available through the API and SDK for automation. Bulk actions are bounded by `limit`, scoped by session/job/task ids, and logged as a single manager event so high-volume task rows remain the durable source of truth.
 
 ## Streaming results
 

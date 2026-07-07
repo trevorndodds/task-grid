@@ -5,6 +5,7 @@ import io
 import json
 import os
 import socket
+import time
 import uuid
 from pathlib import Path
 from urllib import parse, request
@@ -24,6 +25,10 @@ DEFAULT_WORKER_ACTIVE_SECONDS = int(os.environ.get("TASKGRID_WORKER_ACTIVE_SECON
 LEASE_CANDIDATE_MULTIPLIER = max(1, int(os.environ.get("TASKGRID_LEASE_CANDIDATE_MULTIPLIER", "50")))
 VERBOSE_TASK_EVENT_CODES = {"TaskAccepted", "TaskCompleted"}
 DEBUG_EVENT_MODES = {"debug", "verbose", "trace", "all"}
+OPERATOR_CACHE_TTL_MS = max(0, int(os.environ.get("TASKGRID_OPERATOR_CACHE_TTL_MS", "500")))
+LEASE_RECOVERY_INTERVAL_MS = max(0, int(os.environ.get("TASKGRID_LEASE_RECOVERY_INTERVAL_MS", "500")))
+_OPERATOR_CACHE: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
+_LAST_LEASE_RECOVERY_AT = 0.0
 
 
 
@@ -49,6 +54,87 @@ def loads(value: str | None, default: Any = None) -> Any:
     except json.JSONDecodeError:
         return default
 
+
+def _cache_key_part(value: Any) -> Any:
+    if isinstance(value, (list, tuple, set)):
+        return tuple(sorted(_cache_key_part(item) for item in value))
+    if isinstance(value, dict):
+        return tuple(sorted((str(key), _cache_key_part(val)) for key, val in value.items()))
+    return value
+
+
+def _operator_cache_get(key: tuple[Any, ...], *, refresh: bool = False) -> dict[str, Any] | None:
+    if refresh or OPERATOR_CACHE_TTL_MS <= 0:
+        return None
+    cached = _OPERATOR_CACHE.get(key)
+    if not cached:
+        return None
+    created, value = cached
+    age_ms = (time.monotonic() - created) * 1000.0
+    if age_ms > OPERATOR_CACHE_TTL_MS:
+        _OPERATOR_CACHE.pop(key, None)
+        return None
+    out = dict(value)
+    out["cached"] = True
+    out["cache_age_ms"] = int(age_ms)
+    out["cache_ttl_ms"] = OPERATOR_CACHE_TTL_MS
+    return out
+
+
+def _operator_cache_set(key: tuple[Any, ...], value: dict[str, Any]) -> dict[str, Any]:
+    if OPERATOR_CACHE_TTL_MS > 0:
+        stored = dict(value)
+        stored["cached"] = False
+        stored["cache_age_ms"] = 0
+        stored["cache_ttl_ms"] = OPERATOR_CACHE_TTL_MS
+        _OPERATOR_CACHE[key] = (time.monotonic(), stored)
+        return dict(stored)
+    out = dict(value)
+    out["cached"] = False
+    out["cache_age_ms"] = 0
+    out["cache_ttl_ms"] = 0
+    return out
+
+
+def clear_operator_cache() -> None:
+    _OPERATOR_CACHE.clear()
+
+
+def _maybe_expire_stale_tasks(conn, *, force: bool = False) -> dict[str, Any]:
+    global _LAST_LEASE_RECOVERY_AT
+    if not force and LEASE_RECOVERY_INTERVAL_MS > 0:
+        current = time.monotonic()
+        if (current - _LAST_LEASE_RECOVERY_AT) * 1000.0 < LEASE_RECOVERY_INTERVAL_MS:
+            return {"checked_at": now(), "expired": 0, "requeued": 0, "failed": 0, "tasks": [], "skipped": True, "reason": "lease-recovery-throttled"}
+        _LAST_LEASE_RECOVERY_AT = current
+    summary = expire_stale_tasks(conn)
+    if force or LEASE_RECOVERY_INTERVAL_MS > 0:
+        _LAST_LEASE_RECOVERY_AT = time.monotonic()
+    return summary
+
+
+def _leased_task_response(row: Any, *, assigned_id: str, timestamp: str, lease_until: str) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "job_id": row["job_id"],
+        "task_type": row["task_type"],
+        "payload": loads(row["payload_json"], {}),
+        "input_index": row["input_index"] if "input_index" in row.keys() else None,
+        "input_key": row["input_key"] if "input_key" in row.keys() else None,
+        "status": "running",
+        "priority": row["priority"],
+        "attempts": int(row["attempts"] or 0) + 1,
+        "max_retries": row["max_retries"],
+        "assigned_worker_id": assigned_id,
+        "leased_at": timestamp,
+        "lease_expires_at": lease_until,
+        "started_at": row["started_at"] or timestamp,
+        "finished_at": row["finished_at"],
+        "result": loads(row["result_json"], None),
+        "error": row["error"],
+        "created_at": row["created_at"],
+        "updated_at": timestamp,
+    }
 
 
 def _coerce_concurrency(value: Any, default: int = 1) -> int:
@@ -586,6 +672,7 @@ def create_job(
     idempotency_key: str | None = None,
 ) -> dict[str, Any]:
     init_db()
+    clear_operator_cache()
     if input_keys is not None and len(input_keys) != len(payloads):
         raise ValueError("input_keys length must match payloads length")
     job_id = new_id("job")
@@ -750,6 +837,7 @@ def create_job(
 
 def heartbeat_worker(worker_id: str, hostname: str | None = None, status: str = "idle", current_task_id: str | None = None, version: str = "dev", metadata: dict[str, Any] | None = None) -> dict[str, Any]:
     init_db()
+    clear_operator_cache()
     hostname = hostname or socket.gethostname()
     timestamp = now()
     with connection() as conn:
@@ -784,7 +872,7 @@ def heartbeat_worker(worker_id: str, hostname: str | None = None, status: str = 
             log_event(conn, "info", "worker", worker_id, "worker config initialized", {"desired_instances": desired}, code="WorkerConfigInitialized")
         row = conn.execute(
             """
-            SELECT w.*, wc.desired_concurrency, wc.disabled, wc.disabled_at, wc.disabled_reason, wc.updated_at AS config_updated_at, wc.updated_by AS config_updated_by
+            SELECT w.*, wc.desired_concurrency, wc.disabled, wc.disabled_at, wc.disabled_reason, wc.draining, wc.drain_at, wc.drain_reason, wc.updated_at AS config_updated_at, wc.updated_by AS config_updated_by
             FROM workers w
             LEFT JOIN worker_configs wc ON wc.worker_id = w.id
             WHERE w.id=?
@@ -806,6 +894,7 @@ def get_worker_config(worker_id: str) -> dict[str, Any]:
 
 def set_worker_config(worker_id: str, desired_concurrency: int, updated_by: str = "ui") -> dict[str, Any]:
     init_db()
+    clear_operator_cache()
     desired = _coerce_concurrency(desired_concurrency)
     timestamp = now()
     with connection() as conn:
@@ -835,6 +924,7 @@ def set_worker_enabled(worker_id: str, enabled: bool, reason: str | None = None,
     disabled flag and should scale their local instance loops down to zero.
     """
     init_db()
+    clear_operator_cache()
     timestamp = now()
     disabled = 0 if enabled else 1
     clean_reason = str(reason or "").strip()[:500] or None
@@ -880,6 +970,136 @@ def set_workers_enabled(worker_ids: list[str], enabled: bool, reason: str | None
         "workers": changed,
     }
 
+
+
+
+def _clean_reason(reason: str | None) -> str | None:
+    return str(reason or "").strip()[:500] or None
+
+
+def _clean_instance_id(instance_id: str) -> str:
+    item = str(instance_id or "").strip()
+    if not item:
+        raise ValueError("instance_id is required")
+    return item[:200]
+
+
+def _config_disabled(config: Any) -> bool:
+    return bool(config and int(config["disabled"] or 0))
+
+
+def _config_draining(config: Any) -> bool:
+    return bool(config and int(config["draining"] or 0))
+
+
+def _config_blocks_leases(config: Any) -> bool:
+    return _config_disabled(config) or _config_draining(config)
+
+
+def _drained_instance_ids(conn: Any, worker_id: str) -> set[str]:
+    rows = conn.execute(
+        "SELECT instance_id FROM worker_instance_configs WHERE worker_id=? AND draining=1",
+        (worker_id,),
+    ).fetchall()
+    return {str(row["instance_id"]) for row in rows}
+
+
+def _instance_drained(conn: Any, worker_id: str, instance_id: str | None) -> bool:
+    if not instance_id:
+        return False
+    row = conn.execute(
+        "SELECT draining FROM worker_instance_configs WHERE worker_id=? AND instance_id=?",
+        (worker_id, instance_id),
+    ).fetchone()
+    return bool(row and int(row["draining"] or 0))
+
+
+def list_worker_instance_configs(worker_id: str) -> list[dict[str, Any]]:
+    init_db()
+    with connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM worker_instance_configs WHERE worker_id=? ORDER BY instance_id ASC",
+            (worker_id,),
+        ).fetchall()
+        return [row_to_dict(row) for row in rows]
+
+
+def set_worker_draining(worker_id: str, draining: bool, reason: str | None = None, updated_by: str = "api") -> dict[str, Any]:
+    """Set worker drain mode.
+
+    Draining blocks new task leases to the node but does not ask the worker
+    supervisor to scale down. Running tasks may finish and idle instances stay
+    available to resume later. This is different from disable, which also tells
+    heartbeating workers to scale their local instance loops down to zero.
+    """
+    init_db()
+    clear_operator_cache()
+    timestamp = now()
+    clean_reason = _clean_reason(reason)
+    drain_flag = 1 if draining else 0
+    with connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute("SELECT * FROM worker_configs WHERE worker_id=?", (worker_id,)).fetchone()
+        desired = int(existing["desired_concurrency"] or 1) if existing else 1
+        disabled = int(existing["disabled"] or 0) if existing else 0
+        conn.execute(
+            """
+            INSERT INTO worker_configs(worker_id, desired_concurrency, disabled, draining, drain_at, drain_reason, updated_at, updated_by)
+            VALUES(?,?,?,?,?,?,?,?)
+            ON CONFLICT(worker_id) DO UPDATE SET
+                draining=excluded.draining,
+                drain_at=excluded.drain_at,
+                drain_reason=excluded.drain_reason,
+                updated_at=excluded.updated_at,
+                updated_by=excluded.updated_by
+            """,
+            (worker_id, desired, disabled, drain_flag, timestamp if draining else None, clean_reason if draining else None, timestamp, updated_by),
+        )
+        code = "WorkerDrainStarted" if draining else "WorkerDrainCleared"
+        message = "worker drain started" if draining else "worker drain cleared"
+        log_event(conn, "warning", "worker", worker_id, message, {"draining": draining, "reason": clean_reason, "updated_by": updated_by}, code=code)
+        out = conn.execute("SELECT * FROM worker_configs WHERE worker_id=?", (worker_id,)).fetchone()
+        conn.execute("COMMIT")
+        return row_to_dict(out)
+
+
+def set_worker_instance_draining(worker_id: str, instance_id: str, draining: bool, reason: str | None = None, updated_by: str = "api") -> dict[str, Any]:
+    """Set drain mode for one logical worker instance."""
+    init_db()
+    clear_operator_cache()
+    timestamp = now()
+    instance_id = _clean_instance_id(instance_id)
+    clean_reason = _clean_reason(reason)
+    flag = 1 if draining else 0
+    with connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            INSERT INTO worker_configs(worker_id, desired_concurrency, updated_at, updated_by)
+            VALUES(?,?,?,?)
+            ON CONFLICT(worker_id) DO NOTHING
+            """,
+            (worker_id, 1, timestamp, updated_by),
+        )
+        conn.execute(
+            """
+            INSERT INTO worker_instance_configs(worker_id, instance_id, draining, drain_at, drain_reason, updated_at, updated_by)
+            VALUES(?,?,?,?,?,?,?)
+            ON CONFLICT(worker_id, instance_id) DO UPDATE SET
+                draining=excluded.draining,
+                drain_at=excluded.drain_at,
+                drain_reason=excluded.drain_reason,
+                updated_at=excluded.updated_at,
+                updated_by=excluded.updated_by
+            """,
+            (worker_id, instance_id, flag, timestamp if draining else None, clean_reason if draining else None, timestamp, updated_by),
+        )
+        code = "WorkerInstanceDrainStarted" if draining else "WorkerInstanceDrainCleared"
+        message = "worker instance drain started" if draining else "worker instance drain cleared"
+        log_event(conn, "warning", "worker-instance", f"{worker_id}:{instance_id}", message, {"worker_id": worker_id, "instance_id": instance_id, "draining": draining, "reason": clean_reason, "updated_by": updated_by}, code=code)
+        out = conn.execute("SELECT * FROM worker_instance_configs WHERE worker_id=? AND instance_id=?", (worker_id, instance_id)).fetchone()
+        conn.execute("COMMIT")
+        return row_to_dict(out)
 
 def _normalize_tags(value: Any) -> set[str]:
     if value is None:
@@ -958,7 +1178,21 @@ def _worker_capability_row(row: Any, *, active_seconds: int | None = None) -> di
     data["service_version"] = metadata.get("service_version") or metadata.get("image_version") or ""
     data["disabled"] = bool(int(data.get("disabled") or 0))
     data["disabled_reason"] = data.get("disabled_reason") or ""
-    data["active"] = (not data["disabled"]) and _worker_is_active(row, active_seconds=active_seconds)
+    data["draining"] = bool(int(data.get("draining") or 0))
+    data["drain_reason"] = data.get("drain_reason") or ""
+    if data.get("desired_concurrency") is None:
+        data["desired_concurrency"] = _metadata_concurrency(metadata, default=1)
+    else:
+        data["desired_concurrency"] = _coerce_concurrency(data.get("desired_concurrency"), default=1)
+    data["active_concurrency"] = _metadata_concurrency(metadata, default=int(data.get("desired_concurrency") or 1))
+    if "instance_count" in metadata:
+        try:
+            data["active_concurrency"] = max(0, min(MAX_WORKER_CONCURRENCY, int(metadata.get("instance_count") or 0)))
+        except (TypeError, ValueError):
+            pass
+    data["running_tasks"] = int(metadata.get("running_tasks") or 0)
+    data["heartbeat_active"] = _worker_is_active(row, active_seconds=active_seconds)
+    data["active"] = (not data["disabled"]) and (not data["draining"]) and bool(data["heartbeat_active"])
     return data
 
 
@@ -992,9 +1226,10 @@ def _capability_summary_from_rows(
             item["workers"].append(
                 {
                     "id": worker["id"],
-                    "status": "disabled" if worker.get("disabled") else worker["status"],
+                    "status": "disabled" if worker.get("disabled") else ("draining" if worker.get("draining") else worker["status"]),
                     "active": worker["active"],
                     "disabled": bool(worker.get("disabled")),
+                    "draining": bool(worker.get("draining")),
                     "tags": worker.get("tags") or [],
                     "service_name": worker.get("service_name") or "",
                     "service_version": worker.get("service_version") or "",
@@ -1034,11 +1269,272 @@ def _capability_summary_from_rows(
     }
 
 
+def _queued_task_diagnostic(
+    raw: dict[str, Any],
+    *,
+    workers: list[dict[str, Any]],
+    worker_running_counts: dict[str, int],
+    worker_drained_counts: dict[str, int],
+) -> dict[str, Any]:
+    job_metadata = raw.get("job_metadata", {}) or loads(raw.get("job_metadata_json"), {}) or {}
+    required_tags = sorted(_required_tags(job_metadata))
+    task_type = str(raw.get("task_type") or "")
+    blockers: list[str] = []
+    reason = "leaseable_now"
+    detail = "At least one active capable worker appears to have a free execution slot."
+
+    if raw.get("job_status") in {"cancelled", "cancelling"}:
+        reason = "job_not_leaseable"
+        detail = f"Job status is {raw.get('job_status')}."
+        blockers.append(reason)
+    elif int(raw.get("job_paused") or 0):
+        reason = "job_paused"
+        detail = raw.get("job_pause_reason") or "Job is paused."
+        blockers.append(reason)
+    elif int(raw.get("session_paused") or 0):
+        reason = "session_paused"
+        detail = raw.get("session_pause_reason") or "Session is paused."
+        blockers.append(reason)
+    else:
+        supporting: list[dict[str, Any]] = []
+        tag_capable: list[dict[str, Any]] = []
+        active_capable: list[dict[str, Any]] = []
+        free_capable: list[dict[str, Any]] = []
+        required = set(required_tags)
+        for worker in workers:
+            task_types = set(worker.get("task_types") or [])
+            # Empty task catalog means legacy/open worker: same behavior as the
+            # lease path, which only filters when a worker advertises task types.
+            supports_type = (not task_types) or task_type in task_types
+            if not supports_type:
+                continue
+            supporting.append(worker)
+            tags = set(worker.get("tags") or [])
+            if not required.issubset(tags):
+                continue
+            tag_capable.append(worker)
+            if not worker.get("active"):
+                continue
+            active_capable.append(worker)
+            wid = str(worker.get("id") or "")
+            slots = int(worker.get("active_concurrency") or worker.get("desired_concurrency") or 1)
+            busy = int(worker_running_counts.get(wid, 0))
+            drained = int(worker_drained_counts.get(wid, 0))
+            free_slots = max(0, slots - busy - drained)
+            if free_slots > 0:
+                item = dict(worker)
+                item["estimated_free_slots"] = free_slots
+                item["estimated_running_slots"] = busy
+                item["drained_instances"] = drained
+                free_capable.append(item)
+
+        if not workers:
+            reason = "no_workers_registered"
+            detail = "No worker nodes have heartbeated yet."
+        elif not supporting:
+            reason = "no_worker_supports_task_type"
+            detail = f"No worker advertises task type '{task_type}'."
+        elif not tag_capable:
+            reason = "missing_required_tags"
+            detail = f"Workers support task type '{task_type}', but none match required tags {required_tags}."
+        elif not active_capable:
+            disabled = sum(1 for w in tag_capable if w.get("disabled"))
+            draining = sum(1 for w in tag_capable if w.get("draining"))
+            stale = sum(1 for w in tag_capable if not w.get("heartbeat_active"))
+            if disabled and disabled == len(tag_capable):
+                reason = "all_capable_workers_disabled"
+                detail = "All capable workers are disabled."
+            elif draining and draining == len(tag_capable):
+                reason = "all_capable_workers_draining"
+                detail = "All capable workers are draining."
+            elif stale and stale == len(tag_capable):
+                reason = "all_capable_workers_stale"
+                detail = "All capable workers are stale/offline."
+            else:
+                reason = "no_active_capable_worker"
+                detail = "Workers are registered, but no active capable worker can lease this task right now."
+        elif not free_capable:
+            reason = "all_capable_workers_busy"
+            detail = "Active capable workers exist, but their advertised execution slots appear busy or drained."
+        if reason != "leaseable_now":
+            blockers.append(reason)
+
+    return {
+        "task_id": raw.get("id"),
+        "job_id": raw.get("job_id"),
+        "job_name": raw.get("job_name") or "",
+        "job_status": raw.get("job_status") or "",
+        "session_id": raw.get("session_id"),
+        "session_name": raw.get("session_name") or "",
+        "session_status": raw.get("session_status") or "",
+        "task_type": task_type,
+        "input_index": raw.get("input_index"),
+        "input_key": raw.get("input_key"),
+        "priority": raw.get("priority"),
+        "attempts": int(raw.get("attempts") or 0),
+        "max_retries": int(raw.get("max_retries") or 0),
+        "created_at": raw.get("created_at"),
+        "updated_at": raw.get("updated_at"),
+        "required_tags": required_tags,
+        "reason": reason,
+        "blockers": blockers,
+        "detail": detail,
+    }
+
+
+def get_queue_diagnostics(*, limit: int = 1000, active_seconds: int | None = None, refresh: bool = False) -> dict[str, Any]:
+    """Explain queued backlog and why pending tasks are or are not leaseable.
+
+    This is an operator diagnostic, not the scheduler itself. It mirrors the
+    major lease gates: session/job pause state, task type catalog, required
+    tags, worker enable/drain/stale state, and advertised slot pressure.
+    """
+    init_db()
+    limit = max(1, min(10000, int(limit or 1000)))
+    active_for = DEFAULT_WORKER_ACTIVE_SECONDS if active_seconds is None else int(active_seconds)
+    cache_key = ("queue_diagnostics", str(db_path()), limit, active_for)
+    cached = _operator_cache_get(cache_key, refresh=refresh)
+    if cached is not None:
+        return cached
+    timestamp = now()
+    with connection() as conn:
+        worker_rows = conn.execute(
+            """
+            SELECT w.*, wc.desired_concurrency, wc.disabled, wc.disabled_at, wc.disabled_reason,
+                   wc.draining, wc.drain_at, wc.drain_reason, wc.updated_at AS config_updated_at,
+                   wc.updated_by AS config_updated_by
+            FROM workers w
+            LEFT JOIN worker_configs wc ON wc.worker_id = w.id
+            ORDER BY w.last_heartbeat_at DESC
+            """
+        ).fetchall()
+        workers = [_worker_capability_row(row, active_seconds=active_for) for row in worker_rows]
+        known_worker_ids = {str(worker.get("id")) for worker in workers if worker.get("id")}
+        running_rows = conn.execute("SELECT assigned_worker_id FROM tasks WHERE status='running' AND assigned_worker_id IS NOT NULL").fetchall()
+        worker_running_counts: dict[str, int] = {}
+        for row in running_rows:
+            worker_id, _instance_id = _split_executor_assignment(row["assigned_worker_id"], known_worker_ids)
+            if worker_id:
+                worker_running_counts[worker_id] = worker_running_counts.get(worker_id, 0) + 1
+        drained_rows = conn.execute("SELECT worker_id, COUNT(*) AS count FROM worker_instance_configs WHERE draining=1 GROUP BY worker_id").fetchall()
+        worker_drained_counts = {str(row["worker_id"]): int(row["count"] or 0) for row in drained_rows}
+        queued_rows = conn.execute(
+            """
+            SELECT t.*, j.name AS job_name, j.status AS job_status, j.paused AS job_paused,
+                   j.pause_reason AS job_pause_reason, j.metadata_json AS job_metadata_json,
+                   j.session_id AS session_id, s.name AS session_name, s.status AS session_status,
+                   s.paused AS session_paused, s.pause_reason AS session_pause_reason
+            FROM tasks t
+            JOIN jobs j ON j.id = t.job_id
+            LEFT JOIN service_sessions s ON s.id = j.session_id
+            WHERE t.status='queued'
+            ORDER BY t.priority DESC, t.created_at ASC, COALESCE(t.input_index, 9223372036854775807) ASC, t.id ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+    diagnostics: list[dict[str, Any]] = []
+    reason_counts: dict[str, int] = {}
+    task_type_groups: dict[str, dict[str, Any]] = {}
+    session_groups: dict[str, dict[str, Any]] = {}
+    job_groups: dict[str, dict[str, Any]] = {}
+
+    for row in queued_rows:
+        raw = row_to_dict(row)
+        # row_to_dict turns job_metadata_json into job_metadata.
+        item = _queued_task_diagnostic(
+            raw,
+            workers=workers,
+            worker_running_counts=worker_running_counts,
+            worker_drained_counts=worker_drained_counts,
+        )
+        diagnostics.append(item)
+        reason = item["reason"]
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+
+        type_group = task_type_groups.setdefault(
+            item["task_type"],
+            {"task_type": item["task_type"], "queued_tasks": 0, "leaseable_now": 0, "blocked_tasks": 0, "reasons": {}},
+        )
+        type_group["queued_tasks"] += 1
+        if reason == "leaseable_now":
+            type_group["leaseable_now"] += 1
+        else:
+            type_group["blocked_tasks"] += 1
+        type_group["reasons"][reason] = type_group["reasons"].get(reason, 0) + 1
+
+        session_id = item.get("session_id") or "orphan"
+        session_group = session_groups.setdefault(
+            session_id,
+            {"session_id": session_id, "name": item.get("session_name") or "", "status": item.get("session_status") or "", "queued_tasks": 0, "leaseable_now": 0, "blocked_tasks": 0, "reasons": {}},
+        )
+        session_group["queued_tasks"] += 1
+        if reason == "leaseable_now":
+            session_group["leaseable_now"] += 1
+        else:
+            session_group["blocked_tasks"] += 1
+        session_group["reasons"][reason] = session_group["reasons"].get(reason, 0) + 1
+
+        job_id = item.get("job_id") or "unknown"
+        job_group = job_groups.setdefault(
+            job_id,
+            {"job_id": job_id, "name": item.get("job_name") or "", "status": item.get("job_status") or "", "session_id": session_id, "task_type": item.get("task_type"), "queued_tasks": 0, "leaseable_now": 0, "blocked_tasks": 0, "reasons": {}},
+        )
+        job_group["queued_tasks"] += 1
+        if reason == "leaseable_now":
+            job_group["leaseable_now"] += 1
+        else:
+            job_group["blocked_tasks"] += 1
+        job_group["reasons"][reason] = job_group["reasons"].get(reason, 0) + 1
+
+    worker_summaries: list[dict[str, Any]] = []
+    for worker in workers:
+        wid = str(worker.get("id") or "")
+        slots = int(worker.get("active_concurrency") or worker.get("desired_concurrency") or 1)
+        busy = int(worker_running_counts.get(wid, 0))
+        drained = int(worker_drained_counts.get(wid, 0))
+        worker_summaries.append({
+            "worker_id": wid,
+            "hostname": worker.get("hostname") or "",
+            "active": bool(worker.get("active")),
+            "heartbeat_active": bool(worker.get("heartbeat_active")),
+            "disabled": bool(worker.get("disabled")),
+            "draining": bool(worker.get("draining")),
+            "service_name": worker.get("service_name") or "",
+            "service_version": worker.get("service_version") or "",
+            "task_types": sorted(worker.get("task_types") or []),
+            "tags": sorted(worker.get("tags") or []),
+            "active_slots": slots,
+            "running_slots": busy,
+            "drained_slots": drained,
+            "estimated_free_slots": max(0, slots - busy - drained) if worker.get("active") else 0,
+            "last_heartbeat_at": worker.get("last_heartbeat_at"),
+        })
+
+    return _operator_cache_set(cache_key, {
+        "checked_at": timestamp,
+        "active_seconds": active_for,
+        "queued_tasks": len(diagnostics),
+        "leaseable_now": reason_counts.get("leaseable_now", 0),
+        "blocked_tasks": len(diagnostics) - reason_counts.get("leaseable_now", 0),
+        "reason_counts": dict(sorted(reason_counts.items())),
+        "workers_total": len(workers),
+        "workers_active": sum(1 for worker in workers if worker.get("active")),
+        "estimated_free_slots": sum(int(worker.get("estimated_free_slots") or 0) for worker in worker_summaries),
+        "task_types": sorted(task_type_groups.values(), key=lambda item: str(item.get("task_type") or "")),
+        "sessions": sorted(session_groups.values(), key=lambda item: (-int(item.get("queued_tasks") or 0), str(item.get("session_id") or ""))),
+        "jobs": sorted(job_groups.values(), key=lambda item: (-int(item.get("queued_tasks") or 0), str(item.get("job_id") or ""))),
+        "tasks": diagnostics,
+        "workers": worker_summaries,
+    })
+
+
 def get_task_catalog(task_type: str | None = None, required_tags: list[str] | set[str] | tuple[str, ...] | None = None, active_seconds: int | None = None) -> dict[str, Any]:
     init_db()
     with connection() as conn:
         rows = conn.execute("""
-            SELECT w.*, wc.desired_concurrency, wc.disabled, wc.disabled_at, wc.disabled_reason, wc.updated_at AS config_updated_at, wc.updated_by AS config_updated_by
+            SELECT w.*, wc.desired_concurrency, wc.disabled, wc.disabled_at, wc.disabled_reason, wc.draining, wc.drain_at, wc.drain_reason, wc.updated_at AS config_updated_at, wc.updated_by AS config_updated_by
             FROM workers w
             LEFT JOIN worker_configs wc ON wc.worker_id = w.id
             ORDER BY w.last_heartbeat_at DESC
@@ -1051,10 +1547,120 @@ def get_task_catalog(task_type: str | None = None, required_tags: list[str] | se
     )
 
 
+
+
+def get_services(service_name: str | None = None, service_version: str | None = None, active_seconds: int | None = None, *, refresh: bool = False) -> dict[str, Any]:
+    """Return service/application versions currently advertised by worker nodes.
+
+    This is a derived runtime registry. Workers advertise service metadata in
+    their heartbeat, usually from Docker image/build metadata. The manager keeps
+    the raw worker heartbeat as source of truth and groups rows here by
+    service name + service version so operators can see mixed deployments,
+    stale versions, and which task types each service can execute.
+    """
+    init_db()
+    active_for = DEFAULT_WORKER_ACTIVE_SECONDS if active_seconds is None else int(active_seconds)
+    name_filter = str(service_name or "").strip()
+    version_filter = str(service_version or "").strip()
+    cache_key = ("services", str(db_path()), name_filter, version_filter, active_for)
+    cached = _operator_cache_get(cache_key, refresh=refresh)
+    if cached is not None:
+        return cached
+    with connection() as conn:
+        rows = conn.execute("""
+            SELECT w.*, wc.desired_concurrency, wc.disabled, wc.disabled_at, wc.disabled_reason, wc.draining, wc.drain_at, wc.drain_reason, wc.updated_at AS config_updated_at, wc.updated_by AS config_updated_by
+            FROM workers w
+            LEFT JOIN worker_configs wc ON wc.worker_id = w.id
+            ORDER BY w.last_heartbeat_at DESC
+        """).fetchall()
+
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        worker = _worker_capability_row(row, active_seconds=active_for)
+        metadata = worker.get("metadata", {}) or {}
+        svc_name = str(worker.get("service_name") or metadata.get("image_name") or metadata.get("module") or "unknown-service").strip() or "unknown-service"
+        svc_version = str(worker.get("service_version") or metadata.get("image_tag") or worker.get("version") or "unknown").strip() or "unknown"
+        if name_filter and svc_name != name_filter:
+            continue
+        if version_filter and svc_version != version_filter:
+            continue
+
+        service = grouped.setdefault(
+            (svc_name, svc_version),
+            {
+                "service_name": svc_name,
+                "service_version": svc_version,
+                "workers_total": 0,
+                "workers_active": 0,
+                "workers_stale": 0,
+                "workers_disabled": 0,
+                "workers_draining": 0,
+                "desired_instances": 0,
+                "active_instances": 0,
+                "running_tasks": 0,
+                "task_types": set(),
+                "tags": set(),
+                "taskgrid_versions": set(),
+                "workers": [],
+            },
+        )
+        service["workers_total"] += 1
+        if worker.get("active"):
+            service["workers_active"] += 1
+        if not worker.get("heartbeat_active"):
+            service["workers_stale"] += 1
+        if worker.get("disabled"):
+            service["workers_disabled"] += 1
+        if worker.get("draining"):
+            service["workers_draining"] += 1
+        service["desired_instances"] += int(worker.get("desired_concurrency") or 0)
+        service["active_instances"] += int(worker.get("active_concurrency") or 0) if worker.get("heartbeat_active") else 0
+        service["running_tasks"] += int(worker.get("running_tasks") or 0)
+        service["task_types"].update(worker.get("task_types") or [])
+        service["tags"].update(worker.get("tags") or [])
+        if worker.get("version"):
+            service["taskgrid_versions"].add(str(worker.get("version")))
+        service["workers"].append(
+            {
+                "id": worker.get("id"),
+                "hostname": worker.get("hostname"),
+                "status": "disabled" if worker.get("disabled") else ("draining" if worker.get("draining") else (worker.get("status") if worker.get("heartbeat_active") else "stale")),
+                "active": bool(worker.get("active")),
+                "heartbeat_active": bool(worker.get("heartbeat_active")),
+                "disabled": bool(worker.get("disabled")),
+                "draining": bool(worker.get("draining")),
+                "desired_instances": int(worker.get("desired_concurrency") or 0),
+                "active_instances": int(worker.get("active_concurrency") or 0),
+                "running_tasks": int(worker.get("running_tasks") or 0),
+                "task_types": worker.get("task_types") or [],
+                "tags": worker.get("tags") or [],
+                "taskgrid_version": worker.get("version"),
+                "last_heartbeat_at": worker.get("last_heartbeat_at"),
+            }
+        )
+
+    services: list[dict[str, Any]] = []
+    for item in grouped.values():
+        normalized = dict(item)
+        normalized["task_types"] = sorted(item["task_types"])
+        normalized["tags"] = sorted(item["tags"])
+        normalized["taskgrid_versions"] = sorted(item["taskgrid_versions"])
+        normalized["workers"] = sorted(item["workers"], key=lambda w: str(w.get("id") or ""))
+        services.append(normalized)
+    services.sort(key=lambda item: (str(item["service_name"]), str(item["service_version"])))
+    return _operator_cache_set(cache_key, {
+        "active_seconds": active_for,
+        "service_name": name_filter or None,
+        "service_version": version_filter or None,
+        "services_total": len(services),
+        "services": services,
+    })
+
+
 def _capability_for_submit(conn, task_type: str, metadata: dict[str, Any] | None) -> dict[str, Any]:
     required_tags = _required_tags(metadata or {})
     rows = conn.execute("""
-        SELECT w.*, wc.desired_concurrency, wc.disabled, wc.disabled_at, wc.disabled_reason, wc.updated_at AS config_updated_at, wc.updated_by AS config_updated_by
+        SELECT w.*, wc.desired_concurrency, wc.disabled, wc.disabled_at, wc.disabled_reason, wc.draining, wc.drain_at, wc.drain_reason, wc.updated_at AS config_updated_at, wc.updated_by AS config_updated_by
         FROM workers w
         LEFT JOIN worker_configs wc ON wc.worker_id = w.id
         ORDER BY w.last_heartbeat_at DESC
@@ -1231,10 +1837,11 @@ def purge_offline_workers(active_seconds: int | None = None, include_running: bo
 def recovery_status(active_seconds: int | None = None) -> dict[str, Any]:
     """Return manager-side health/recovery state without mutating task state."""
     init_db()
+    active_for = DEFAULT_WORKER_ACTIVE_SECONDS if active_seconds is None else int(active_seconds)
     timestamp = now()
     with connection() as conn:
         worker_rows = conn.execute("SELECT * FROM workers ORDER BY last_heartbeat_at DESC").fetchall()
-        workers = [_worker_capability_row(row, active_seconds=active_seconds) for row in worker_rows]
+        workers = [_worker_capability_row(row, active_seconds=active_for) for row in worker_rows]
         stale_workers = [worker for worker in workers if not worker.get("active")]
         running = conn.execute(
             """
@@ -1426,7 +2033,7 @@ def lease_tasks(worker_id: str, limit: int = 1, lease_seconds: int = 60, instanc
     leased: list[dict[str, Any]] = []
     with connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        expire_stale_tasks(conn)
+        _maybe_expire_stale_tasks(conn)
         worker = conn.execute("SELECT * FROM workers WHERE id=?", (worker_id,)).fetchone()
         if not worker:
             # Direct core/API tests may lease before a supervisor heartbeat. Runtime
@@ -1449,7 +2056,7 @@ def lease_tasks(worker_id: str, limit: int = 1, lease_seconds: int = 60, instanc
             )
             worker = conn.execute("SELECT * FROM workers WHERE id=?", (worker_id,)).fetchone()
         config = conn.execute("SELECT * FROM worker_configs WHERE worker_id=?", (worker_id,)).fetchone()
-        if config and int(config["disabled"] or 0):
+        if _config_blocks_leases(config) or _instance_drained(conn, worker_id, instance_id):
             conn.execute("COMMIT")
             return []
         worker_metadata = row_to_dict(worker).get("metadata", {}) if worker else {}
@@ -1480,7 +2087,7 @@ def lease_tasks(worker_id: str, limit: int = 1, lease_seconds: int = 60, instanc
             required = _required_tags(job_metadata)
             if required and not required.issubset(tags):
                 continue
-            conn.execute(
+            cur = conn.execute(
                 """
                 UPDATE tasks
                 SET status='running', attempts=attempts+1, assigned_worker_id=?,
@@ -1489,9 +2096,8 @@ def lease_tasks(worker_id: str, limit: int = 1, lease_seconds: int = 60, instanc
                 """,
                 (assigned_id, timestamp, lease_until, timestamp, timestamp, row["id"]),
             )
-            updated = conn.execute("SELECT * FROM tasks WHERE id=?", (row["id"],)).fetchone()
-            if updated:
-                leased.append(row_to_dict(updated))
+            if cur.rowcount:
+                leased.append(_leased_task_response(row, assigned_id=assigned_id, timestamp=timestamp, lease_until=lease_until))
                 log_event(conn, "info", "task", row["id"], "task accepted by worker", execution_event_data(worker_id, instance_id, job_id=row["job_id"], task_type=row["task_type"], worker_tags=sorted(tags), required_tags=sorted(required)), code="TaskAccepted")
                 _mark_task_started_incremental(conn, row["job_id"], row["job_session_id"], timestamp)
             if len(leased) >= limit:
@@ -1526,7 +2132,7 @@ def lease_tasks_for_instances(worker_id: str, instance_ids: list[str], lease_sec
     leased: list[dict[str, Any]] = []
     with connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        expire_stale_tasks(conn)
+        _maybe_expire_stale_tasks(conn)
         worker = conn.execute("SELECT * FROM workers WHERE id=?", (worker_id,)).fetchone()
         if not worker:
             conn.execute(
@@ -1546,7 +2152,12 @@ def lease_tasks_for_instances(worker_id: str, instance_ids: list[str], lease_sec
             )
             worker = conn.execute("SELECT * FROM workers WHERE id=?", (worker_id,)).fetchone()
         config = conn.execute("SELECT * FROM worker_configs WHERE worker_id=?", (worker_id,)).fetchone()
-        if config and int(config["disabled"] or 0):
+        if _config_blocks_leases(config):
+            conn.execute("COMMIT")
+            return []
+        drained_instances = _drained_instance_ids(conn, worker_id)
+        cleaned = [item for item in cleaned if item not in drained_instances]
+        if not cleaned:
             conn.execute("COMMIT")
             return []
         worker_metadata = row_to_dict(worker).get("metadata", {}) if worker else {}
@@ -1579,7 +2190,7 @@ def lease_tasks_for_instances(worker_id: str, instance_ids: list[str], lease_sec
             if required and not required.issubset(tags):
                 continue
             assigned_id = executor_id(worker_id, current_instance)
-            conn.execute(
+            cur = conn.execute(
                 """
                 UPDATE tasks
                 SET status='running', attempts=attempts+1, assigned_worker_id=?,
@@ -1588,9 +2199,8 @@ def lease_tasks_for_instances(worker_id: str, instance_ids: list[str], lease_sec
                 """,
                 (assigned_id, timestamp, lease_until, timestamp, timestamp, row["id"]),
             )
-            updated = conn.execute("SELECT * FROM tasks WHERE id=?", (row["id"],)).fetchone()
-            if updated:
-                item = row_to_dict(updated)
+            if cur.rowcount:
+                item = _leased_task_response(row, assigned_id=assigned_id, timestamp=timestamp, lease_until=lease_until)
                 item["leased_instance_id"] = current_instance
                 leased.append(item)
                 log_event(
@@ -1713,8 +2323,11 @@ def fail_task(task_id: str, worker_id: str, error: str, instance_id: str | None 
         else:
             next_status = "failed"
             finished_at = timestamp
-            assigned_worker = None
-            leased_at = None
+            # Preserve the final executor slot for durable task history. Queued
+            # retries clear assignment, but terminal failures should still show
+            # which worker instance produced the final failure.
+            assigned_worker = assigned_id
+            leased_at = task["leased_at"]
             lease_expires = None
             message = "task failed; retries exhausted"
             level = "error"
@@ -1734,8 +2347,205 @@ def fail_task(task_id: str, worker_id: str, error: str, instance_id: str | None 
         return row_to_dict(out) if out else None
 
 
+
+def bulk_update_tasks(
+    *,
+    action: str,
+    session_id: str | None = None,
+    job_id: str | None = None,
+    task_ids: list[str] | None = None,
+    statuses: list[str] | None = None,
+    reset_attempts: bool = True,
+    include_running: bool = False,
+    limit: int = 5000,
+    updated_by: str = "api",
+) -> dict[str, Any]:
+    """Apply an operator task action to a bounded selected task set.
+
+    This is intentionally selection-driven rather than a scheduler primitive:
+    it lets UI/API clients make queue/history drilldowns actionable without
+    creating hidden per-task logs or a second task-control model.
+    """
+    init_db()
+    clear_operator_cache()
+    normalized_action = str(action or "").strip().lower().replace("-", "_")
+    if normalized_action in {"retry_failed", "retry_cancelled", "requeue"}:
+        normalized_action = "retry"
+    if normalized_action in {"cancel_queued", "cancel_filtered"}:
+        normalized_action = "cancel"
+    if normalized_action not in {"retry", "cancel"}:
+        raise ValueError("action must be retry or cancel")
+
+    allowed_statuses = {"queued", "running", "succeeded", "failed", "cancelled"}
+    selected_statuses = {str(item).strip().lower() for item in (statuses or []) if str(item).strip()}
+    if not selected_statuses:
+        selected_statuses = {"failed", "cancelled"} if normalized_action == "retry" else {"queued"}
+    selected_statuses = {status for status in selected_statuses if status in allowed_statuses}
+    if normalized_action == "retry":
+        selected_statuses &= {"failed", "cancelled"}
+    elif not include_running:
+        selected_statuses -= {"running"}
+    if not selected_statuses:
+        return {
+            "action": normalized_action,
+            "selected": 0,
+            "changed": 0,
+            "skipped": 0,
+            "statuses": [],
+            "tasks": [],
+            "message": "no eligible statuses selected",
+        }
+
+    bounded_limit = max(1, min(int(limit or 5000), 10000))
+    task_ids = [str(item) for item in (task_ids or []) if str(item)]
+    timestamp = now()
+
+    where = []
+    params: list[Any] = []
+    if session_id:
+        where.append("j.session_id=?")
+        params.append(session_id)
+    if job_id:
+        where.append("t.job_id=?")
+        params.append(job_id)
+    if task_ids:
+        placeholders = ",".join("?" for _ in task_ids)
+        where.append(f"t.id IN ({placeholders})")
+        params.extend(task_ids)
+    if not where:
+        raise ValueError("session_id, job_id, or task_ids is required")
+    placeholders = ",".join("?" for _ in selected_statuses)
+    where.append(f"t.status IN ({placeholders})")
+    params.extend(sorted(selected_statuses))
+
+    order_sql = "COALESCE(t.input_index, 9223372036854775807) ASC, t.created_at ASC, t.id ASC"
+    with connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            f"""
+            SELECT t.id, t.job_id, t.status, t.assigned_worker_id, t.input_index, t.input_key,
+                   j.session_id, j.status AS job_status
+            FROM tasks t
+            JOIN jobs j ON j.id = t.job_id
+            WHERE {' AND '.join(where)}
+            ORDER BY {order_sql}
+            LIMIT ?
+            """,
+            (*params, bounded_limit),
+        ).fetchall()
+
+        selected = [row_to_dict(row) for row in rows]
+        changed_ids: list[str] = []
+        skipped: list[dict[str, Any]] = []
+        changed_job_ids: set[str] = set()
+        changed_session_ids: set[str] = set()
+
+        if normalized_action == "retry":
+            eligible = [task for task in selected if task.get("job_status") not in {"cancelled", CANCELLING_JOB_STATUS}]
+            skipped = [
+                {"task_id": task["id"], "reason": "job_cancelled", "status": task.get("status")}
+                for task in selected
+                if task.get("job_status") in {"cancelled", CANCELLING_JOB_STATUS}
+            ]
+            if eligible:
+                ids = [task["id"] for task in eligible]
+                id_sql = ",".join("?" for _ in ids)
+                attempts_sql = "attempts=0," if reset_attempts else ""
+                conn.execute(
+                    f"""
+                    UPDATE tasks
+                    SET status='queued', {attempts_sql} assigned_worker_id=NULL, leased_at=NULL,
+                        lease_expires_at=NULL, finished_at=NULL, error=NULL, updated_at=?
+                    WHERE id IN ({id_sql})
+                    """,
+                    (timestamp, *ids),
+                )
+                changed_ids = ids
+                for task in eligible:
+                    changed_job_ids.add(task["job_id"])
+                    if task.get("session_id"):
+                        changed_session_ids.add(task["session_id"])
+        else:
+            eligible = selected
+            if eligible:
+                ids = [task["id"] for task in eligible]
+                id_sql = ",".join("?" for _ in ids)
+                # Queued tasks have no live assignment. Running tasks may be force-cancelled
+                # with include_running=true; preserve their assignment so history shows the
+                # slot that was interrupted/ignored later.
+                conn.execute(
+                    f"""
+                    UPDATE tasks
+                    SET status='cancelled',
+                        assigned_worker_id=CASE WHEN status='running' THEN assigned_worker_id ELSE NULL END,
+                        lease_expires_at=NULL, finished_at=?, error=NULL, updated_at=?
+                    WHERE id IN ({id_sql})
+                    """,
+                    (timestamp, timestamp, *ids),
+                )
+                changed_ids = ids
+                for task in eligible:
+                    changed_job_ids.add(task["job_id"])
+                    if task.get("session_id"):
+                        changed_session_ids.add(task["session_id"])
+
+        for jid in sorted(changed_job_ids):
+            recalc_job(conn, jid)
+        scope: dict[str, Any] = {"session_id": session_id, "job_id": job_id, "task_ids": task_ids[:100] if task_ids else []}
+        event_entity_type = "service_session" if session_id else "job" if job_id else "task"
+        event_entity_id = session_id or job_id or (changed_ids[0] if changed_ids else "bulk")
+        log_event(
+            conn,
+            "warning",
+            event_entity_type,
+            str(event_entity_id),
+            f"bulk task {normalized_action} applied",
+            {
+                "action": normalized_action,
+                "selected": len(selected),
+                "changed": len(changed_ids),
+                "skipped": len(skipped),
+                "statuses": sorted(selected_statuses),
+                "reset_attempts": reset_attempts,
+                "include_running": include_running,
+                "updated_by": updated_by,
+                **{k: v for k, v in scope.items() if v},
+            },
+            code="TaskBulkActionRun",
+        )
+        task_rows = []
+        if changed_ids:
+            id_sql = ",".join("?" for _ in changed_ids)
+            task_rows = conn.execute(
+                f"""
+                SELECT id AS task_id, job_id, status, input_index, input_key, assigned_worker_id, updated_at
+                FROM tasks WHERE id IN ({id_sql})
+                ORDER BY COALESCE(input_index, 9223372036854775807) ASC, created_at ASC, id ASC
+                """,
+                changed_ids,
+            ).fetchall()
+        conn.execute("COMMIT")
+
+    return {
+        "action": normalized_action,
+        "selected": len(selected),
+        "changed": len(changed_ids),
+        "skipped": len(skipped),
+        "statuses": sorted(selected_statuses),
+        "reset_attempts": reset_attempts,
+        "include_running": include_running,
+        "session_id": session_id,
+        "job_id": job_id,
+        "changed_jobs": sorted(changed_job_ids),
+        "changed_sessions": sorted(changed_session_ids),
+        "tasks": [row_to_dict(row) for row in task_rows],
+        "skipped_tasks": skipped,
+        "limit": bounded_limit,
+    }
+
 def retry_task(task_id: str, reset_attempts: bool = True) -> dict[str, Any] | None:
     init_db()
+    clear_operator_cache()
     timestamp = now()
     with connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -1810,6 +2620,7 @@ def cancel_job(job_id: str, mode: str = "graceful") -> dict[str, Any] | None:
     and running tasks cancelled immediately.
     """
     init_db()
+    clear_operator_cache()
     timestamp = now()
     normalized_mode = str(mode or "graceful").strip().lower()
     force = normalized_mode in {"force", "immediate", "hard"}
@@ -2112,6 +2923,584 @@ def list_session_jobs(session_id: str, limit: int = 500) -> list[dict[str, Any]]
         ).fetchall()
         return [row_to_dict(row) for row in rows]
 
+
+
+def _split_executor_assignment(assigned_worker_id: Any, known_worker_ids: set[str] | None = None) -> tuple[str | None, str | None]:
+    """Split a stored executor id into worker node and logical instance ids.
+
+    TaskGrid stores precise execution slots in ``assigned_worker_id`` using the
+    ``worker-id-instance-id`` form. Worker ids may themselves contain hyphens,
+    so prefer matching the longest known worker id and fall back to the common
+    ``-instance-`` suffix pattern used by worker supervisors.
+    """
+    assigned = str(assigned_worker_id or "").strip()
+    if not assigned:
+        return None, None
+    known_worker_ids = known_worker_ids or set()
+    for worker_id in sorted((item for item in known_worker_ids if item), key=len, reverse=True):
+        if assigned == worker_id:
+            return worker_id, None
+        prefix = f"{worker_id}-"
+        if assigned.startswith(prefix):
+            return worker_id, assigned[len(prefix):] or None
+    marker = "-instance-"
+    if marker in assigned:
+        left, right = assigned.rsplit(marker, 1)
+        if left and right:
+            return left, f"instance-{right}"
+    return assigned, None
+
+
+def _seconds_between(start: Any, end: Any | None = None) -> float | None:
+    started = _parse_utc(start)
+    if not started:
+        return None
+    ended = _parse_utc(end) if end else datetime.now(timezone.utc)
+    if not ended:
+        return None
+    return max(0.0, (ended - started).total_seconds())
+
+
+def get_session_assignments(session_id: str, *, limit: int = 1000) -> dict[str, Any] | None:
+    """Return a session-centric view of current task placement and slot stats.
+
+    This powers the session drilldown UI: operators can see queued/running/final
+    task counts, which worker/instance each running task is assigned to, and a
+    compact per-worker/per-instance rollup for the selected service session.
+    """
+    init_db()
+    limit = max(1, min(5000, int(limit or 1000)))
+    timestamp = now()
+    with connection() as conn:
+        session_row = conn.execute("SELECT * FROM service_sessions WHERE id=?", (session_id,)).fetchone()
+        if not session_row:
+            return None
+        session = row_to_dict(session_row)
+        job_rows = conn.execute("SELECT * FROM jobs WHERE session_id=? ORDER BY created_at ASC", (session_id,)).fetchall()
+        jobs_by_id = {row["id"]: row_to_dict(row) for row in job_rows}
+        worker_rows = conn.execute(
+            """
+            SELECT w.*, wc.desired_concurrency, wc.disabled, wc.disabled_at, wc.disabled_reason,
+                   wc.draining, wc.drain_at, wc.drain_reason,
+                   wc.updated_at AS config_updated_at, wc.updated_by AS config_updated_by
+            FROM workers w
+            LEFT JOIN worker_configs wc ON wc.worker_id = w.id
+            ORDER BY w.last_heartbeat_at DESC
+            """
+        ).fetchall()
+        workers = [_worker_capability_row(row) for row in worker_rows]
+        worker_by_id = {str(worker.get("id")): worker for worker in workers if worker.get("id")}
+        known_worker_ids = set(worker_by_id)
+        drained_rows = conn.execute("SELECT * FROM worker_instance_configs ORDER BY worker_id ASC, instance_id ASC").fetchall()
+        drained_instances = {
+            (str(row["worker_id"]), str(row["instance_id"])): row_to_dict(row)
+            for row in drained_rows
+            if int(row["draining"] or 0)
+        }
+        task_rows = conn.execute(
+            """
+            SELECT t.*, j.name AS job_name, j.status AS job_status, j.priority AS job_priority,
+                   j.created_at AS job_created_at
+            FROM tasks t
+            JOIN jobs j ON j.id = t.job_id
+            WHERE j.session_id=?
+            ORDER BY
+              CASE t.status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 WHEN 'failed' THEN 2 WHEN 'cancelled' THEN 3 ELSE 4 END,
+              COALESCE(t.input_index, 9223372036854775807) ASC,
+              t.created_at ASC,
+              t.id ASC
+            LIMIT ?
+            """,
+            (session_id, limit),
+        ).fetchall()
+
+    status_counts: dict[str, int] = {"queued": 0, "running": 0, "succeeded": 0, "failed": 0, "cancelled": 0}
+    worker_stats: dict[str, dict[str, Any]] = {}
+    unassigned = 0
+    tasks: list[dict[str, Any]] = []
+
+    def worker_state(worker: dict[str, Any] | None) -> str:
+        if not worker:
+            return "unknown"
+        if worker.get("disabled"):
+            return "disabled"
+        if worker.get("draining"):
+            return "draining"
+        if not worker.get("heartbeat_active"):
+            return "stale"
+        return "online"
+
+    def ensure_worker(worker_id: str | None) -> dict[str, Any] | None:
+        if not worker_id:
+            return None
+        worker = worker_by_id.get(worker_id)
+        stats = worker_stats.get(worker_id)
+        if stats:
+            return stats
+        metadata = (worker or {}).get("metadata", {}) or {}
+        desired = int((worker or {}).get("desired_concurrency") or _metadata_concurrency(metadata, default=1))
+        active_instances = int((worker or {}).get("active_concurrency") or desired or 1)
+        stats = {
+            "worker_id": worker_id,
+            "hostname": (worker or {}).get("hostname") or "",
+            "state": worker_state(worker),
+            "service_name": (worker or {}).get("service_name") or metadata.get("service_name") or metadata.get("service") or "",
+            "service_version": (worker or {}).get("service_version") or metadata.get("service_version") or metadata.get("image_version") or "",
+            "taskgrid_version": (worker or {}).get("version") or "",
+            "tags": sorted((worker or {}).get("tags") or []),
+            "task_types": sorted((worker or {}).get("task_types") or []),
+            "desired_instances": desired,
+            "active_instances": active_instances,
+            "disabled": bool((worker or {}).get("disabled")),
+            "draining": bool((worker or {}).get("draining")),
+            "last_heartbeat_at": (worker or {}).get("last_heartbeat_at"),
+            "session_tasks": 0,
+            "running_tasks": 0,
+            "queued_tasks": 0,
+            "completed_tasks": 0,
+            "failed_tasks": 0,
+            "cancelled_tasks": 0,
+            "instances": {},
+        }
+        for i in range(1, max(1, active_instances) + 1):
+            instance_id = f"instance-{i:03d}"
+            drained = drained_instances.get((worker_id, instance_id))
+            stats["instances"][instance_id] = {
+                "worker_id": worker_id,
+                "instance_id": instance_id,
+                "state": "drained" if drained else ("disabled" if stats["disabled"] else ("draining" if stats["draining"] else ("stale" if stats["state"] == "stale" else "idle"))),
+                "draining": bool(drained),
+                "drain_reason": (drained or {}).get("drain_reason") or "",
+                "session_tasks": 0,
+                "running_tasks": 0,
+                "completed_tasks": 0,
+                "failed_tasks": 0,
+                "cancelled_tasks": 0,
+                "current_task": None,
+            }
+        worker_stats[worker_id] = stats
+        return stats
+
+    for row in task_rows:
+        raw = row_to_dict(row)
+        status = str(raw.get("status") or "unknown")
+        status_counts[status] = status_counts.get(status, 0) + 1
+        worker_id, instance_id = _split_executor_assignment(raw.get("assigned_worker_id"), known_worker_ids)
+        job = jobs_by_id.get(raw.get("job_id"), {})
+        runtime_seconds = _seconds_between(raw.get("started_at"), raw.get("finished_at") if status != "running" else None)
+        item = {
+            "task_id": raw.get("id"),
+            "job_id": raw.get("job_id"),
+            "job_name": raw.get("job_name") or job.get("name") or "",
+            "job_status": raw.get("job_status") or job.get("status") or "",
+            "task_type": raw.get("task_type"),
+            "input_index": raw.get("input_index"),
+            "input_key": raw.get("input_key"),
+            "status": status,
+            "attempts": int(raw.get("attempts") or 0),
+            "max_retries": int(raw.get("max_retries") or 0),
+            "assigned_worker_id": raw.get("assigned_worker_id"),
+            "worker_id": worker_id,
+            "instance_id": instance_id,
+            "executor_id": raw.get("assigned_worker_id"),
+            "created_at": raw.get("created_at"),
+            "started_at": raw.get("started_at"),
+            "finished_at": raw.get("finished_at"),
+            "updated_at": raw.get("updated_at"),
+            "lease_expires_at": raw.get("lease_expires_at"),
+            "runtime_seconds": runtime_seconds,
+            "error": raw.get("error"),
+        }
+        tasks.append(item)
+        if not worker_id:
+            unassigned += 1
+            continue
+        stats = ensure_worker(worker_id)
+        if not stats:
+            continue
+        stats["session_tasks"] += 1
+        if status == "running":
+            stats["running_tasks"] += 1
+        elif status == "queued":
+            stats["queued_tasks"] += 1
+        elif status == "succeeded":
+            stats["completed_tasks"] += 1
+        elif status == "failed":
+            stats["failed_tasks"] += 1
+        elif status == "cancelled":
+            stats["cancelled_tasks"] += 1
+        if instance_id:
+            instances = stats["instances"]
+            inst = instances.setdefault(
+                instance_id,
+                {
+                    "worker_id": worker_id,
+                    "instance_id": instance_id,
+                    "state": "idle",
+                    "draining": bool(drained_instances.get((worker_id, instance_id))),
+                    "drain_reason": (drained_instances.get((worker_id, instance_id)) or {}).get("drain_reason") or "",
+                    "session_tasks": 0,
+                    "running_tasks": 0,
+                    "completed_tasks": 0,
+                    "failed_tasks": 0,
+                    "cancelled_tasks": 0,
+                    "current_task": None,
+                },
+            )
+            inst["session_tasks"] += 1
+            if status == "running":
+                inst["running_tasks"] += 1
+                inst["state"] = "running"
+                inst["current_task"] = item
+            elif status == "succeeded":
+                inst["completed_tasks"] += 1
+            elif status == "failed":
+                inst["failed_tasks"] += 1
+            elif status == "cancelled":
+                inst["cancelled_tasks"] += 1
+
+    normalized_workers: list[dict[str, Any]] = []
+    for stats in worker_stats.values():
+        instances = list(stats.pop("instances").values())
+        instances.sort(key=lambda item: str(item.get("instance_id") or ""))
+        stats["instances"] = instances
+        normalized_workers.append(stats)
+    normalized_workers.sort(key=lambda item: str(item.get("worker_id") or ""))
+
+    running_tasks = [item for item in tasks if item["status"] == "running"]
+    return {
+        "session": session,
+        "session_id": session_id,
+        "name": session.get("name"),
+        "status": session.get("status"),
+        "checked_at": timestamp,
+        "task_limit": limit,
+        "task_count_returned": len(tasks),
+        "status_counts": status_counts,
+        "unassigned_tasks": unassigned,
+        "running_assignments": len(running_tasks),
+        "assigned_workers": len(normalized_workers),
+        "assigned_instances": sum(1 for worker in normalized_workers for inst in worker.get("instances", []) if inst.get("session_tasks")),
+        "current_assignments": running_tasks,
+        "workers": normalized_workers,
+        "tasks": tasks,
+    }
+
+
+def _task_assignment_summary(raw: dict[str, Any], *, known_worker_ids: set[str] | None = None) -> dict[str, Any]:
+    status = str(raw.get("status") or "unknown")
+    worker_id, instance_id = _split_executor_assignment(raw.get("assigned_worker_id"), known_worker_ids)
+    return {
+        "task_id": raw.get("id"),
+        "job_id": raw.get("job_id"),
+        "job_name": raw.get("job_name") or "",
+        "job_status": raw.get("job_status") or "",
+        "session_id": raw.get("session_id"),
+        "session_name": raw.get("session_name") or "",
+        "session_status": raw.get("session_status") or "",
+        "task_type": raw.get("task_type"),
+        "input_index": raw.get("input_index"),
+        "input_key": raw.get("input_key"),
+        "status": status,
+        "attempts": int(raw.get("attempts") or 0),
+        "max_retries": int(raw.get("max_retries") or 0),
+        "assigned_worker_id": raw.get("assigned_worker_id"),
+        "worker_id": worker_id,
+        "instance_id": instance_id,
+        "executor_id": raw.get("assigned_worker_id"),
+        "created_at": raw.get("created_at"),
+        "started_at": raw.get("started_at"),
+        "finished_at": raw.get("finished_at"),
+        "updated_at": raw.get("updated_at"),
+        "lease_expires_at": raw.get("lease_expires_at"),
+        "runtime_seconds": _seconds_between(raw.get("started_at"), raw.get("finished_at") if status != "running" else None),
+        "error": raw.get("error"),
+    }
+
+
+def _worker_state_from_worker(worker: dict[str, Any] | None) -> str:
+    if not worker:
+        return "unknown"
+    if worker.get("disabled"):
+        return "disabled"
+    if worker.get("draining"):
+        return "draining"
+    if not worker.get("heartbeat_active"):
+        return "stale"
+    return "online"
+
+
+def _worker_slots_from_metadata(worker: dict[str, Any], drained_instances: dict[tuple[str, str], dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    worker_id = str(worker.get("id") or "")
+    metadata = worker.get("metadata", {}) or {}
+    desired = int(worker.get("desired_concurrency") or _metadata_concurrency(metadata, default=1) or 1)
+    active_instances = int(worker.get("active_concurrency") or desired or 1)
+    snapshot_rows = metadata.get("instances") if isinstance(metadata.get("instances"), list) else []
+    slots: dict[str, dict[str, Any]] = {}
+
+    def base_slot(instance_id: str) -> dict[str, Any]:
+        drained = drained_instances.get((worker_id, instance_id))
+        return {
+            "worker_id": worker_id,
+            "instance_id": instance_id,
+            "executor_id": executor_id(worker_id, instance_id),
+            "state": "idle",
+            "worker_state": _worker_state_from_worker(worker),
+            "worker_disabled": bool(worker.get("disabled")),
+            "worker_draining": bool(worker.get("draining")),
+            "worker_stale": not bool(worker.get("heartbeat_active")),
+            "instance_draining": bool(drained),
+            "draining": bool(drained),
+            "drain_reason": (drained or {}).get("drain_reason") or "",
+            "status": "idle",
+            "current_task": None,
+            "current_task_id": None,
+            "advertised_current_task_id": None,
+            "tasks_completed": 0,
+            "last_poll_at": None,
+            "last_error": None,
+            "log_path": f"instances/{instance_id}/worker.log",
+        }
+
+    for i in range(1, max(0, active_instances) + 1):
+        iid = f"instance-{i:03d}"
+        slots[iid] = base_slot(iid)
+
+    for snap in snapshot_rows:
+        if not isinstance(snap, dict):
+            continue
+        iid = str(snap.get("instance_id") or "").strip()
+        if not iid:
+            continue
+        slot = slots.setdefault(iid, base_slot(iid))
+        slot["status"] = snap.get("status") or slot["status"]
+        slot["advertised_current_task_id"] = snap.get("current_task_id")
+        slot["current_task_id"] = snap.get("current_task_id")
+        slot["tasks_completed"] = int(snap.get("tasks_completed") or 0)
+        slot["last_poll_at"] = snap.get("last_poll_at")
+        slot["last_error"] = snap.get("last_error")
+
+    for (drain_worker_id, iid), drained in drained_instances.items():
+        if drain_worker_id != worker_id:
+            continue
+        slot = slots.setdefault(iid, base_slot(iid))
+        slot["instance_draining"] = True
+        slot["draining"] = True
+        slot["drain_reason"] = drained.get("drain_reason") or ""
+
+    for slot in slots.values():
+        if slot.get("current_task"):
+            slot["state"] = "running"
+        elif slot.get("worker_disabled"):
+            slot["state"] = "disabled"
+        elif slot.get("worker_stale"):
+            slot["state"] = "stale"
+        elif slot.get("instance_draining"):
+            slot["state"] = "drained"
+        elif slot.get("worker_draining"):
+            slot["state"] = "draining"
+        else:
+            slot["state"] = str(slot.get("status") or "idle")
+            if slot["state"] in {"leasing", "polling"}:
+                slot["state"] = "idle"
+    return slots
+
+
+def list_executors(*, limit: int = 1000, active_seconds: int | None = None, refresh: bool = False) -> dict[str, Any]:
+    """Return a manager-wide execution-slot dashboard.
+
+    Unlike session assignments, this shows every known worker instance/slot and
+    its current task regardless of session. It is derived from worker heartbeat
+    metadata, drain config, and durable running task rows.
+    """
+    init_db()
+    bounded_limit = max(1, min(5000, int(limit or 1000)))
+    active_for = DEFAULT_WORKER_ACTIVE_SECONDS if active_seconds is None else int(active_seconds)
+    cache_key = ("executors", str(db_path()), bounded_limit, active_for)
+    cached = _operator_cache_get(cache_key, refresh=refresh)
+    if cached is not None:
+        return cached
+    timestamp = now()
+    with connection() as conn:
+        worker_rows = conn.execute(
+            """
+            SELECT w.*, wc.desired_concurrency, wc.disabled, wc.disabled_at, wc.disabled_reason,
+                   wc.draining, wc.drain_at, wc.drain_reason, wc.updated_at AS config_updated_at,
+                   wc.updated_by AS config_updated_by
+            FROM workers w
+            LEFT JOIN worker_configs wc ON wc.worker_id = w.id
+            ORDER BY w.last_heartbeat_at DESC
+            LIMIT ?
+            """,
+            (bounded_limit,),
+        ).fetchall()
+        workers = [_worker_capability_row(row, active_seconds=active_for) for row in worker_rows]
+        known_worker_ids = {str(worker.get("id")) for worker in workers if worker.get("id")}
+        drained_rows = conn.execute("SELECT * FROM worker_instance_configs ORDER BY worker_id ASC, instance_id ASC").fetchall()
+        drained_instances = {
+            (str(row["worker_id"]), str(row["instance_id"])): row_to_dict(row)
+            for row in drained_rows
+            if int(row["draining"] or 0)
+        }
+        running_rows = conn.execute(
+            """
+            SELECT t.*, j.name AS job_name, j.status AS job_status, j.session_id AS session_id,
+                   s.name AS session_name, s.status AS session_status
+            FROM tasks t
+            JOIN jobs j ON j.id = t.job_id
+            LEFT JOIN service_sessions s ON s.id = j.session_id
+            WHERE t.status='running'
+            ORDER BY t.started_at ASC, t.updated_at ASC, t.id ASC
+            """
+        ).fetchall()
+
+    running_tasks = [_task_assignment_summary(row_to_dict(row), known_worker_ids=known_worker_ids) for row in running_rows]
+    running_by_executor = {str(item.get("executor_id") or ""): item for item in running_tasks if item.get("executor_id")}
+    running_by_worker: dict[str, list[dict[str, Any]]] = {}
+    for item in running_tasks:
+        if item.get("worker_id"):
+            running_by_worker.setdefault(str(item["worker_id"]), []).append(item)
+
+    worker_items: list[dict[str, Any]] = []
+    all_instances: list[dict[str, Any]] = []
+    for worker in workers:
+        worker_id = str(worker.get("id") or "")
+        metadata = worker.get("metadata", {}) or {}
+        slots = _worker_slots_from_metadata(worker, drained_instances)
+        for item in running_by_worker.get(worker_id, []):
+            instance_id = item.get("instance_id") or "node"
+            slot = slots.setdefault(instance_id, {
+                "worker_id": worker_id,
+                "instance_id": instance_id,
+                "executor_id": item.get("executor_id") or executor_id(worker_id, instance_id),
+                "state": "running",
+                "worker_state": _worker_state_from_worker(worker),
+                "worker_disabled": bool(worker.get("disabled")),
+                "worker_draining": bool(worker.get("draining")),
+                "worker_stale": not bool(worker.get("heartbeat_active")),
+                "instance_draining": bool(drained_instances.get((worker_id, instance_id))),
+                "draining": bool(drained_instances.get((worker_id, instance_id))),
+                "drain_reason": (drained_instances.get((worker_id, instance_id)) or {}).get("drain_reason") or "",
+                "status": "running",
+                "current_task": None,
+                "current_task_id": None,
+                "advertised_current_task_id": None,
+                "tasks_completed": 0,
+                "last_poll_at": None,
+                "last_error": None,
+                "log_path": f"instances/{instance_id}/worker.log" if instance_id != "node" else "supervisor.log",
+            })
+            slot["state"] = "running"
+            slot["status"] = "running"
+            slot["current_task"] = item
+            slot["current_task_id"] = item.get("task_id")
+
+        normalized_slots = list(slots.values())
+        normalized_slots.sort(key=lambda item: str(item.get("instance_id") or ""))
+        for slot in normalized_slots:
+            task = slot.get("current_task")
+            if task:
+                slot["session_id"] = task.get("session_id")
+                slot["job_id"] = task.get("job_id")
+                slot["task_id"] = task.get("task_id")
+            slot["service_name"] = worker.get("service_name") or metadata.get("service_name") or metadata.get("service") or ""
+            slot["service_version"] = worker.get("service_version") or metadata.get("service_version") or metadata.get("image_version") or ""
+            slot["taskgrid_version"] = worker.get("version") or ""
+            slot["hostname"] = worker.get("hostname") or ""
+            all_instances.append(slot)
+
+        worker_items.append({
+            "worker_id": worker_id,
+            "hostname": worker.get("hostname") or "",
+            "state": _worker_state_from_worker(worker),
+            "status": worker.get("status") or "",
+            "service_name": worker.get("service_name") or metadata.get("service_name") or metadata.get("service") or "",
+            "service_version": worker.get("service_version") or metadata.get("service_version") or metadata.get("image_version") or "",
+            "taskgrid_version": worker.get("version") or "",
+            "tags": sorted(worker.get("tags") or []),
+            "task_types": sorted(worker.get("task_types") or []),
+            "desired_instances": int(worker.get("desired_concurrency") or _metadata_concurrency(metadata, default=1) or 1),
+            "active_instances": int(worker.get("active_concurrency") or 0),
+            "running_instances": sum(1 for slot in normalized_slots if slot.get("state") == "running"),
+            "idle_instances": sum(1 for slot in normalized_slots if slot.get("state") == "idle"),
+            "drained_instances": sum(1 for slot in normalized_slots if slot.get("instance_draining")),
+            "disabled": bool(worker.get("disabled")),
+            "draining": bool(worker.get("draining")),
+            "stale": not bool(worker.get("heartbeat_active")),
+            "last_heartbeat_at": worker.get("last_heartbeat_at"),
+            "instances": normalized_slots,
+        })
+
+    state_counts: dict[str, int] = {}
+    for slot in all_instances:
+        state = str(slot.get("state") or "unknown")
+        state_counts[state] = state_counts.get(state, 0) + 1
+
+    return _operator_cache_set(cache_key, {
+        "checked_at": timestamp,
+        "worker_count": len(worker_items),
+        "instance_count": len(all_instances),
+        "running_instances": state_counts.get("running", 0),
+        "idle_instances": state_counts.get("idle", 0),
+        "drained_instances": sum(1 for slot in all_instances if slot.get("instance_draining")),
+        "disabled_instances": state_counts.get("disabled", 0),
+        "stale_instances": state_counts.get("stale", 0),
+        "state_counts": state_counts,
+        "running_tasks": len(running_tasks),
+        "workers": worker_items,
+        "instances": all_instances,
+    })
+
+
+def get_executor(worker_id: str, instance_id: str, *, recent_limit: int = 100) -> dict[str, Any] | None:
+    init_db()
+    summary = list_executors(limit=1000)
+    instance = None
+    worker = None
+    for worker_item in summary.get("workers", []):
+        if worker_item.get("worker_id") == worker_id:
+            worker = worker_item
+            for slot in worker_item.get("instances", []):
+                if slot.get("instance_id") == instance_id:
+                    instance = slot
+                    break
+            break
+    if worker is None:
+        return None
+    if instance is None:
+        instance = {
+            "worker_id": worker_id,
+            "instance_id": instance_id,
+            "executor_id": executor_id(worker_id, instance_id),
+            "state": "unknown",
+            "current_task": None,
+            "log_path": f"instances/{instance_id}/worker.log",
+        }
+    exec_id = executor_id(worker_id, instance_id)
+    with connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT t.*, j.name AS job_name, j.status AS job_status, j.session_id AS session_id,
+                   s.name AS session_name, s.status AS session_status
+            FROM tasks t
+            JOIN jobs j ON j.id = t.job_id
+            LEFT JOIN service_sessions s ON s.id = j.session_id
+            WHERE t.assigned_worker_id=?
+            ORDER BY t.updated_at DESC, t.created_at DESC, t.id DESC
+            LIMIT ?
+            """,
+            (exec_id, recent_limit),
+        ).fetchall()
+    recent_tasks = [_task_assignment_summary(row_to_dict(row), known_worker_ids={worker_id}) for row in rows]
+    return {
+        "checked_at": now(),
+        "worker": {key: value for key, value in worker.items() if key != "instances"},
+        "instance": instance,
+        "current_task": instance.get("current_task"),
+        "recent_tasks": recent_tasks,
+        "recent_task_count": len(recent_tasks),
+    }
+
 def list_jobs(limit: int = 100, status: str | None = None) -> list[dict[str, Any]]:
     init_db()
     with connection() as conn:
@@ -2264,6 +3653,138 @@ def get_session_results(session_id: str, *, order: str = "input") -> dict[str, A
             ],
         }
 
+
+
+def get_session_task_history(
+    session_id: str,
+    *,
+    limit: int = 5000,
+    status: str | None = None,
+    job_id: str | None = None,
+    order: str = "input",
+) -> dict[str, Any] | None:
+    """Return durable task history for a service session.
+
+    Unlike ``get_session_assignments(...)``, which is optimized around current
+    placement, this endpoint is history-first: finished sessions remain fully
+    drillable, with every task's final worker/instance assignment, attempt
+    counts, timing, payload/result/error, and job mapping.
+    """
+    init_db()
+    limit = max(1, min(10000, int(limit or 5000)))
+    normalized_status = str(status or "").strip().lower() or None
+    normalized_job_id = str(job_id or "").strip() or None
+    with connection() as conn:
+        session_row = conn.execute("SELECT * FROM service_sessions WHERE id=?", (session_id,)).fetchone()
+        if not session_row:
+            return None
+        session = row_to_dict(session_row)
+        job_rows = conn.execute("SELECT * FROM jobs WHERE session_id=? ORDER BY created_at ASC, id ASC", (session_id,)).fetchall()
+        jobs = [row_to_dict(row) for row in job_rows]
+        worker_rows = conn.execute("SELECT id FROM workers").fetchall()
+        known_worker_ids = {str(row["id"]) for row in worker_rows if row["id"]}
+
+        clauses = ["j.session_id=?"]
+        params: list[Any] = [session_id]
+        if normalized_status:
+            clauses.append("t.status=?")
+            params.append(normalized_status)
+        if normalized_job_id:
+            clauses.append("j.id=?")
+            params.append(normalized_job_id)
+        params.append(limit)
+        rows = conn.execute(
+            f"""
+            SELECT t.*, j.name AS job_name, j.status AS job_status, j.priority AS job_priority,
+                   j.created_at AS job_created_at, j.session_id AS session_id,
+                   s.name AS session_name, s.status AS session_status
+            FROM tasks t
+            JOIN jobs j ON j.id = t.job_id
+            LEFT JOIN service_sessions s ON s.id = j.session_id
+            WHERE {' AND '.join(clauses)}
+            ORDER BY
+              j.created_at ASC,
+              j.id ASC,
+              COALESCE(t.input_index, 9223372036854775807) ASC,
+              t.created_at ASC,
+              t.id ASC
+            LIMIT ?
+            """,
+            tuple(params),
+        ).fetchall()
+
+    tasks: list[dict[str, Any]] = []
+    status_counts: dict[str, int] = {"queued": 0, "running": 0, "succeeded": 0, "failed": 0, "cancelled": 0}
+    worker_ids: set[str] = set()
+    instance_keys: set[tuple[str, str]] = set()
+    total_runtime = 0.0
+    runtime_count = 0
+
+    for row in rows:
+        raw = row_to_dict(row)
+        assignment = _task_assignment_summary(raw, known_worker_ids=known_worker_ids)
+        result_info = _task_result_row(raw)
+        task = {
+            **assignment,
+            "job_priority": raw.get("job_priority"),
+            "job_created_at": raw.get("job_created_at"),
+            "payload": result_info.get("payload"),
+            "payload_bytes": result_info.get("payload_bytes"),
+            "result": result_info.get("result"),
+            "result_bytes": result_info.get("result_bytes"),
+        }
+        status_counts[task["status"]] = status_counts.get(task["status"], 0) + 1
+        if task.get("worker_id"):
+            worker_ids.add(str(task["worker_id"]))
+        if task.get("worker_id") and task.get("instance_id"):
+            instance_keys.add((str(task["worker_id"]), str(task["instance_id"])))
+        if task.get("runtime_seconds") is not None:
+            total_runtime += float(task["runtime_seconds"] or 0)
+            runtime_count += 1
+        tasks.append(task)
+
+    ordered_tasks = _ordered_result_tasks(tasks, order=order)
+    return {
+        "session_id": session["id"],
+        "name": session["name"],
+        "status": session["status"],
+        "priority": session.get("priority", 0),
+        "total_jobs": session.get("total_jobs", len(jobs)),
+        "total_tasks": session.get("total_tasks", len(tasks)),
+        "queued_tasks": session.get("queued_tasks", 0),
+        "running_tasks": session.get("running_tasks", 0),
+        "completed_tasks": session.get("completed_tasks", 0),
+        "failed_tasks": session.get("failed_tasks", 0),
+        "cancelled_tasks": session.get("cancelled_tasks", 0),
+        "created_at": session.get("created_at"),
+        "started_at": session.get("started_at"),
+        "finished_at": session.get("finished_at"),
+        "filters": {"status": normalized_status, "job_id": normalized_job_id, "order": order, "limit": limit},
+        "status_counts": status_counts,
+        "assigned_workers": len(worker_ids),
+        "assigned_instances": len(instance_keys),
+        "average_runtime_seconds": (total_runtime / runtime_count) if runtime_count else None,
+        "jobs": [
+            {
+                "job_id": job["id"],
+                "name": job["name"],
+                "task_type": job["task_type"],
+                "status": job["status"],
+                "priority": job.get("priority", 0),
+                "total_tasks": job.get("total_tasks", 0),
+                "completed_tasks": job.get("completed_tasks", 0),
+                "failed_tasks": job.get("failed_tasks", 0),
+                "cancelled_tasks": job.get("cancelled_tasks", 0),
+                "created_at": job.get("created_at"),
+                "started_at": job.get("started_at"),
+                "finished_at": job.get("finished_at"),
+            }
+            for job in jobs
+        ],
+        "tasks": ordered_tasks,
+        "task_count": len(ordered_tasks),
+        "has_more": len(tasks) >= limit,
+    }
 
 
 
@@ -2795,7 +4316,7 @@ def list_workers(limit: int = 100) -> list[dict[str, Any]]:
     with connection() as conn:
         rows = conn.execute(
             """
-            SELECT w.*, wc.desired_concurrency, wc.disabled, wc.disabled_at, wc.disabled_reason, wc.updated_at AS config_updated_at, wc.updated_by AS config_updated_by
+            SELECT w.*, wc.desired_concurrency, wc.disabled, wc.disabled_at, wc.disabled_reason, wc.draining, wc.drain_at, wc.drain_reason, wc.updated_at AS config_updated_at, wc.updated_by AS config_updated_by
             FROM workers w
             LEFT JOIN worker_configs wc ON wc.worker_id = w.id
             ORDER BY w.last_heartbeat_at DESC
@@ -2818,12 +4339,15 @@ def list_workers(limit: int = 100) -> list[dict[str, Any]]:
             data["service_version"] = metadata.get("service_version") or metadata.get("image_version") or ""
             data["disabled"] = bool(int(data.get("disabled") or 0))
             data["disabled_reason"] = data.get("disabled_reason") or ""
+            data["draining"] = bool(int(data.get("draining") or 0))
+            data["drain_reason"] = data.get("drain_reason") or ""
+            data["drained_instances"] = [item.get("instance_id") for item in list_worker_instance_configs(data["id"]) if int(item.get("draining") or 0)]
             if "instance_count" in metadata:
                 try:
                     data["active_concurrency"] = max(0, min(MAX_WORKER_CONCURRENCY, int(metadata.get("instance_count") or 0)))
                 except (TypeError, ValueError):
                     pass
-            data["active"] = _worker_is_active(row)
+            data["active"] = (not data["disabled"]) and (not data["draining"]) and _worker_is_active(row)
             out.append(data)
         return out
 
@@ -2837,7 +4361,7 @@ def get_worker(worker_id: str) -> dict[str, Any] | None:
     with connection() as conn:
         row = conn.execute(
             """
-            SELECT w.*, wc.desired_concurrency, wc.disabled, wc.disabled_at, wc.disabled_reason, wc.updated_at AS config_updated_at, wc.updated_by AS config_updated_by
+            SELECT w.*, wc.desired_concurrency, wc.disabled, wc.disabled_at, wc.disabled_reason, wc.draining, wc.drain_at, wc.drain_reason, wc.updated_at AS config_updated_at, wc.updated_by AS config_updated_by
             FROM workers w
             LEFT JOIN worker_configs wc ON wc.worker_id = w.id
             WHERE w.id=?
@@ -2859,12 +4383,16 @@ def get_worker(worker_id: str) -> dict[str, Any] | None:
         data["service_version"] = metadata.get("service_version") or metadata.get("image_version") or ""
         data["disabled"] = bool(int(data.get("disabled") or 0))
         data["disabled_reason"] = data.get("disabled_reason") or ""
+        data["draining"] = bool(int(data.get("draining") or 0))
+        data["drain_reason"] = data.get("drain_reason") or ""
+        data["instance_configs"] = list_worker_instance_configs(data["id"])
+        data["drained_instances"] = [item.get("instance_id") for item in data["instance_configs"] if int(item.get("draining") or 0)]
         if "instance_count" in metadata:
             try:
                 data["active_concurrency"] = max(0, min(MAX_WORKER_CONCURRENCY, int(metadata.get("instance_count") or 0)))
             except (TypeError, ValueError):
                 pass
-        data["active"] = _worker_is_active(row)
+        data["active"] = (not data["disabled"]) and (not data["draining"]) and _worker_is_active(row)
         return data
 
 

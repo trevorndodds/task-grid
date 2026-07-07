@@ -253,6 +253,34 @@ Pausing a job does not cancel running tasks. It prevents queued tasks in that jo
 GET /jobs/{job_id}/tasks
 ```
 
+
+### Bulk task actions
+
+```http
+POST /tasks/bulk-action
+POST /sessions/{session_id}/tasks/bulk-action
+POST /jobs/{job_id}/tasks/bulk-action
+```
+
+Request body:
+
+```json
+{
+  "action": "retry",
+  "session_id": "sess_abc123",
+  "job_id": null,
+  "task_ids": null,
+  "statuses": ["failed", "cancelled"],
+  "reset_attempts": true,
+  "include_running": false,
+  "limit": 5000
+}
+```
+
+Supported actions are `retry` and `cancel`, with aliases such as `retry_failed` and `cancel_queued`. Retry only applies to failed/cancelled tasks. Cancel defaults to queued tasks; pass `include_running=true` with `statuses:["running"]` to force-cancel running tasks. Force-cancelled running tasks keep their final executor assignment for history, and late worker completions are ignored.
+
+Response includes selected/changed/skipped counts, changed task ids, and affected jobs/sessions.
+
 ### Get job results
 
 ```http
@@ -301,6 +329,25 @@ Example response shape:
 }
 ```
 
+
+### Get session task history
+
+```http
+GET /sessions/{session_id}/tasks/history?status=failed&order=input&limit=5000
+```
+
+Returns durable task history for a service session. This is intended for finished-session drilldown and audit-style review. It is not limited to currently running assignments.
+
+Query parameters:
+
+| Parameter | Description |
+| --- | --- |
+| `status` | Optional `queued`, `running`, `succeeded`, `failed`, or `cancelled` filter. |
+| `job_id` | Optional filter to one job inside the session. |
+| `order` | `input` by default; also supports `completed`, `started`, and `status`. |
+| `limit` | Maximum task rows, 1 to 10000. |
+
+Response includes session counters, status counts, assigned worker/instance counts, jobs, and task rows with `task_id`, `job_id`, `input_index`, `input_key`, `status`, `worker_id`, `instance_id`, attempts, timing, payload/result sizes, result, and error.
 
 ### Stream job results
 
@@ -474,6 +521,14 @@ GET /sessions/{session_id}/results
 
 Returns results across every job attached to the session.
 
+### Session assignment drilldown
+
+```http
+GET /sessions/{session_id}/assignments?limit=1000
+```
+
+Returns a session-scoped execution view with `status_counts`, `running_assignments`, `current_assignments`, `workers`, and `tasks`. Each running assignment includes the job, task, input index/key, worker id, instance id, executor id, lease expiry, attempts, and runtime seconds. Worker rollups include session task counts by status plus per-instance state/current task data. This is the API behind the Session UI assignment drilldown.
+
 ---
 
 ## Tasks
@@ -569,11 +624,128 @@ If no active worker advertises that task type and tag set, the manager returns H
 ### Stream session results
 
 ```http
+GET /sessions/{session_id}/assignments
 GET /sessions/{session_id}/results/stream?poll_seconds=0.5&timeout_seconds=0&replay=true
 Accept: text/event-stream
 ```
 
 Streams the same `progress`, `result`, `done`, and `timeout` event types across every job in the service session. Each result includes `job_id` and `job_name` so clients can route completions back to the originating job.
+
+
+## Queue diagnostics
+
+```http
+GET /queue/diagnostics?limit=1000
+```
+
+Returns an operator view of queued backlog and schedulability. It does not mutate queue state. It explains each queued task using the same major gates as the lease path: job/session pause state, job cancellation state, advertised task types, required tags, worker disabled/drain/stale state, and estimated slot pressure.
+
+Response shape:
+
+```json
+{
+  "queued_tasks": 4,
+  "leaseable_now": 1,
+  "blocked_tasks": 3,
+  "reason_counts": {
+    "leaseable_now": 1,
+    "session_paused": 1,
+    "missing_required_tags": 1,
+    "no_worker_supports_task_type": 1
+  },
+  "task_types": [
+    {"task_type": "echo", "queued_tasks": 2, "leaseable_now": 1, "blocked_tasks": 1}
+  ],
+  "tasks": [
+    {
+      "task_id": "task_...",
+      "session_id": "sess_...",
+      "job_id": "job_...",
+      "task_type": "echo",
+      "input_index": 0,
+      "input_key": "row-1",
+      "reason": "leaseable_now",
+      "required_tags": ["cpu"],
+      "detail": "At least one active capable worker appears to have a free execution slot."
+    }
+  ],
+  "workers": [
+    {
+      "worker_id": "node-a",
+      "active": true,
+      "task_types": ["echo"],
+      "tags": ["cpu"],
+      "running_slots": 1,
+      "active_slots": 4,
+      "estimated_free_slots": 3
+    }
+  ]
+}
+```
+
+The web UI is available at `/ui/queue`. It is intended for “why is this session/job not moving?” triage and complements `/ui/executors`, which shows what is running now.
+
+## Services registry
+
+```http
+GET /services
+GET /services?service_name=risk-engine
+GET /services?service_name=risk-engine&service_version=1.2.0
+```
+
+Returns service/application versions derived from worker heartbeats. Workers normally advertise these values with `TASKGRID_SERVICE_NAME` and `TASKGRID_SERVICE_VERSION` or worker metadata. The registry is grouped by `service_name + service_version` and includes worker counts, active/stale/disabled/draining counts, desired and active instances, running tasks, task types, tags, TaskGrid package versions, and member workers.
+
+This is a runtime registry only; TaskGrid still does not distribute code dynamically. Docker images remain the code/package distribution mechanism.
+
+
+## Executors
+
+### List all execution slots
+
+```http
+GET /executors?limit=1000
+```
+
+Returns a manager-wide live view of worker instances. Unlike `GET /sessions/{session_id}/assignments`, this is not scoped to one session. It includes idle, running, drained, disabled, and stale slots.
+
+Response shape:
+
+```json
+{
+  "checked_at": "2026-06-28T12:00:00+00:00",
+  "worker_count": 1,
+  "instance_count": 2,
+  "running_instances": 1,
+  "idle_instances": 1,
+  "drained_instances": 0,
+  "state_counts": {"running": 1, "idle": 1},
+  "instances": [
+    {
+      "worker_id": "node-a",
+      "instance_id": "instance-001",
+      "executor_id": "node-a-instance-001",
+      "state": "running",
+      "service_name": "risk-engine",
+      "service_version": "1.2.0",
+      "current_task": {
+        "task_id": "task_...",
+        "session_id": "sess_...",
+        "job_id": "job_...",
+        "task_type": "price"
+      },
+      "log_path": "instances/instance-001/worker.log"
+    }
+  ]
+}
+```
+
+### Get one execution slot
+
+```http
+GET /executors/{worker_id}/instances/{instance_id}?recent_limit=100
+```
+
+Returns worker metadata, the selected instance, the current running task if one exists, and recent task history assigned to that instance.
 
 ## Workers
 
@@ -583,7 +755,7 @@ Streams the same `progress`, `result`, `done`, and `timeout` event types across 
 GET /workers?limit=100
 ```
 
-Worker metadata includes node status, tags, configured instances, active instances, log URL, current task summaries, and heartbeat time when available.
+Worker metadata includes node status, tags, configured instances, active instances, log URL, current task summaries, heartbeat time, disabled/draining state, and drained instance IDs when available.
 
 ### Get worker logs
 
@@ -638,6 +810,24 @@ Request:
 ```
 
 The field is named `desired_concurrency` for backwards compatibility, but it now means desired single-task instances for that node.
+
+### Drain worker or instance
+
+```http
+POST /workers/{worker_id}/drain
+POST /workers/{worker_id}/undrain
+POST /workers/{worker_id}/instances/{instance_id}/drain
+POST /workers/{worker_id}/instances/{instance_id}/undrain
+Content-Type: application/json
+```
+
+Request body for drain calls:
+
+```json
+{"reason": "maintenance window"}
+```
+
+Drain mode is a scheduling hold. Running tasks are allowed to finish, but the manager does not issue new leases to the drained worker or drained instance. This differs from disable: disabled workers also receive a heartbeat config that tells the supervisor to scale local instance loops down to zero until re-enabled.
 
 ### Purge offline workers
 
@@ -1025,3 +1215,26 @@ Payload:
 ```
 
 Each returned task is assigned to a concrete worker instance, for example `node-a-instance-002`, so task tracking remains precise.
+
+
+## Operator endpoint caching
+
+The heavy operator read endpoints support a short in-process snapshot cache:
+
+```http
+GET /queue/diagnostics?refresh=false
+GET /executors?refresh=false
+GET /services?refresh=false
+```
+
+Set `refresh=true` to bypass the cache. Responses include:
+
+```json
+{
+  "cached": false,
+  "cache_age_ms": 0,
+  "cache_ttl_ms": 500
+}
+```
+
+Tune the TTL with `TASKGRID_OPERATOR_CACHE_TTL_MS`. A value of `0` disables the cache. The cache is intentionally short-lived and is meant to reduce repeated UI/API read pressure while the manager is under active lease/complete load.

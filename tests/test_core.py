@@ -904,3 +904,443 @@ def test_idempotent_job_submit_replays_existing_job_for_retry():
             idempotency_key="submit-123",
         )
         assert other["id"] != first["id"]
+
+
+def test_drained_worker_blocks_new_leases_without_disabling_node():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/drained-worker.db"
+        from taskgrid import core
+
+        core.heartbeat_worker("node-drain", metadata={"task_types": ["echo"], "instance_count": 2})
+        job = core.create_job("drain demo", "echo", [{"n": 1}, {"n": 2}])
+
+        config = core.set_worker_draining("node-drain", True, reason="maintenance", updated_by="test")
+        assert int(config["draining"]) == 1
+        assert int(config["disabled"] or 0) == 0
+        assert core.lease_tasks("node-drain", limit=1, instance_id="instance-001") == []
+        assert core.lease_tasks_for_instances("node-drain", ["instance-001", "instance-002"]) == []
+
+        worker = core.get_worker("node-drain")
+        assert worker is not None
+        assert worker["draining"] is True
+        assert worker["disabled"] is False
+        assert worker["drain_reason"] == "maintenance"
+
+        config = core.set_worker_draining("node-drain", False, updated_by="test")
+        assert int(config["draining"] or 0) == 0
+        leased = core.lease_tasks("node-drain", limit=1, instance_id="instance-001")
+        assert len(leased) == 1
+        assert leased[0]["job_id"] == job["id"]
+
+
+def test_drained_instance_is_skipped_by_batch_leasing_and_can_resume():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/drained-instance.db"
+        from taskgrid import core
+
+        core.heartbeat_worker("node-inst", metadata={"task_types": ["echo"], "instance_count": 3})
+        core.create_job("instance drain demo", "echo", [{"n": i} for i in range(3)])
+
+        instance_config = core.set_worker_instance_draining("node-inst", "instance-002", True, reason="bad slot", updated_by="test")
+        assert int(instance_config["draining"]) == 1
+        assert core.lease_tasks("node-inst", limit=1, instance_id="instance-002") == []
+
+        leased = core.lease_tasks_for_instances("node-inst", ["instance-001", "instance-002", "instance-003"])
+        assert len(leased) == 2
+        assert {task["leased_instance_id"] for task in leased} == {"instance-001", "instance-003"}
+        assert all("instance-002" not in task["assigned_worker_id"] for task in leased)
+
+        worker = core.get_worker("node-inst")
+        assert worker is not None
+        assert worker["drained_instances"] == ["instance-002"]
+
+        core.set_worker_instance_draining("node-inst", "instance-002", False, updated_by="test")
+        resumed = core.lease_tasks("node-inst", limit=1, instance_id="instance-002")
+        assert len(resumed) == 1
+        assert resumed[0]["assigned_worker_id"] == "node-inst-instance-002"
+
+
+def test_drained_worker_is_not_capable_for_strict_submit():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/drain-capability.db"
+        from taskgrid import core
+
+        core.heartbeat_worker("node-cap-drain", metadata={"task_types": ["echo"], "tags": ["cpu"], "instance_count": 1})
+        core.set_worker_draining("node-cap-drain", True, reason="maintenance", updated_by="test")
+        catalog = core.get_task_catalog(task_type="echo")
+        assert catalog["supporting_workers"]
+        assert not catalog["capable_workers"]
+        assert catalog["workers"][0]["draining"] is True
+        try:
+            core.create_job("strict drain", "echo", [{"n": 1}], require_capable_worker=True)
+        except core.CapabilityError as exc:
+            assert "no active capable worker" in str(exc)
+        else:
+            raise AssertionError("strict submit should fail when only supporting worker is drained")
+
+
+def test_services_registry_groups_worker_service_versions_and_states():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/services.db"
+        from taskgrid import core
+
+        core.heartbeat_worker(
+            "risk-a",
+            metadata={
+                "service_name": "risk-engine",
+                "service_version": "1.0.0",
+                "task_types": ["price", "risk"],
+                "tags": ["cpu", "risk"],
+                "instance_count": 2,
+                "running_tasks": 1,
+            },
+        )
+        core.heartbeat_worker(
+            "risk-b",
+            metadata={
+                "service_name": "risk-engine",
+                "service_version": "1.0.0",
+                "task_types": ["risk"],
+                "tags": ["gpu", "risk"],
+                "instance_count": 3,
+            },
+        )
+        core.heartbeat_worker(
+            "risk-old",
+            metadata={
+                "service_name": "risk-engine",
+                "service_version": "0.9.0",
+                "task_types": ["risk"],
+                "tags": ["risk"],
+                "instance_count": 1,
+            },
+        )
+        core.set_worker_draining("risk-b", True, reason="rollout", updated_by="test")
+        core.set_worker_enabled("risk-old", enabled=False, reason="old image", updated_by="test")
+
+        registry = core.get_services()
+        services = {(item["service_name"], item["service_version"]): item for item in registry["services"]}
+        current = services[("risk-engine", "1.0.0")]
+
+        assert current["workers_total"] == 2
+        assert current["workers_active"] == 1
+        assert current["workers_draining"] == 1
+        assert current["running_tasks"] == 1
+        assert current["active_instances"] == 5
+        assert current["task_types"] == ["price", "risk"]
+        assert current["tags"] == ["cpu", "gpu", "risk"]
+        assert {worker["id"] for worker in current["workers"]} == {"risk-a", "risk-b"}
+
+        old = services[("risk-engine", "0.9.0")]
+        assert old["workers_disabled"] == 1
+        assert old["workers_active"] == 0
+
+        filtered = core.get_services(service_name="risk-engine", service_version="1.0.0")
+        assert filtered["services_total"] == 1
+        assert filtered["services"][0]["service_version"] == "1.0.0"
+
+
+def test_session_assignments_show_worker_instance_and_status_rollups():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/session-assignments.db"
+        from taskgrid import core
+
+        core.heartbeat_worker(
+            "node-session",
+            metadata={
+                "task_types": ["echo"],
+                "tags": ["cpu"],
+                "instance_count": 3,
+                "service_name": "session-worker",
+                "service_version": "1.0.0",
+            },
+        )
+        job = core.create_job(
+            "assignment demo",
+            "echo",
+            [{"n": 1}, {"n": 2}, {"n": 3}],
+            input_keys=["row-1", "row-2", "row-3"],
+        )
+        leased = core.lease_tasks_for_instances("node-session", ["instance-001", "instance-002"])
+        assert len(leased) == 2
+        core.complete_task(leased[0]["id"], "node-session", {"ok": leased[0]["input_key"]}, instance_id="instance-001")
+
+        summary = core.get_session_assignments(job["session_id"])
+        assert summary is not None
+        assert summary["status_counts"]["succeeded"] == 1
+        assert summary["status_counts"]["running"] == 1
+        assert summary["status_counts"]["queued"] == 1
+        assert summary["running_assignments"] == 1
+        running = summary["current_assignments"][0]
+        assert running["worker_id"] == "node-session"
+        assert running["instance_id"] == "instance-002"
+        assert running["input_key"] == "row-2"
+        worker = summary["workers"][0]
+        assert worker["worker_id"] == "node-session"
+        assert worker["service_name"] == "session-worker"
+        assert worker["running_tasks"] == 1
+        assert worker["completed_tasks"] == 1
+        instance = next(item for item in worker["instances"] if item["instance_id"] == "instance-002")
+        assert instance["state"] == "running"
+        assert instance["current_task"]["task_id"] == leased[1]["id"]
+
+
+def test_executors_show_global_instance_slots_and_current_tasks():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/executors.db"
+        from taskgrid import core
+
+        core.heartbeat_worker(
+            "node-exec",
+            metadata={
+                "task_types": ["echo"],
+                "tags": ["cpu"],
+                "instance_count": 3,
+                "service_name": "executor-service",
+                "service_version": "1.0.0",
+                "instances": [
+                    {"instance_id": "instance-001", "status": "idle", "tasks_completed": 2, "last_poll_at": "2026-01-01T00:00:00+00:00"},
+                    {"instance_id": "instance-002", "status": "running", "current_task_id": "advertised-only"},
+                    {"instance_id": "instance-003", "status": "idle"},
+                ],
+            },
+        )
+        core.set_worker_instance_draining("node-exec", "instance-003", True, reason="slot maintenance", updated_by="test")
+        job = core.create_job("executor demo", "echo", [{"n": 1}, {"n": 2}], input_keys=["one", "two"])
+        leased = core.lease_tasks_for_instances("node-exec", ["instance-001", "instance-002"])
+        assert len(leased) == 2
+
+        summary = core.list_executors()
+        assert summary["worker_count"] == 1
+        assert summary["instance_count"] == 3
+        assert summary["running_instances"] == 2
+        assert summary["drained_instances"] == 1
+        slots = {(item["worker_id"], item["instance_id"]): item for item in summary["instances"]}
+        slot_1 = slots[("node-exec", "instance-001")]
+        assert slot_1["state"] == "running"
+        assert slot_1["current_task"]["session_id"] == job["session_id"]
+        assert slot_1["current_task"]["input_key"] == "one"
+        assert slot_1["service_name"] == "executor-service"
+        slot_3 = slots[("node-exec", "instance-003")]
+        assert slot_3["state"] == "drained"
+        assert slot_3["drain_reason"] == "slot maintenance"
+
+        detail = core.get_executor("node-exec", "instance-001")
+        assert detail is not None
+        assert detail["instance"]["state"] == "running"
+        assert detail["current_task"]["task_id"] == leased[0]["id"]
+        assert detail["recent_tasks"][0]["task_id"] == leased[0]["id"]
+
+
+def test_session_task_history_keeps_finished_session_drilldown():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/session-history.db"
+        from taskgrid import core
+
+        core.heartbeat_worker(
+            "node-history",
+            metadata={
+                "task_types": ["echo"],
+                "instance_count": 2,
+                "service_name": "history-worker",
+                "service_version": "1.0.0",
+            },
+        )
+        job = core.create_job(
+            "history demo",
+            "echo",
+            [{"n": 1}, {"n": 2}],
+            input_keys=["row-1", "row-2"],
+            max_retries=0,
+        )
+        leased = core.lease_tasks_for_instances("node-history", ["instance-001", "instance-002"])
+        assert len(leased) == 2
+        core.complete_task(leased[0]["id"], "node-history", {"ok": leased[0]["input_key"]}, instance_id="instance-001")
+        core.fail_task(leased[1]["id"], "node-history", "boom", instance_id="instance-002")
+
+        session = core.get_session(job["session_id"])
+        assert session is not None
+        assert session["status"] == "failed"
+
+        history = core.get_session_task_history(job["session_id"])
+        assert history is not None
+        assert history["task_count"] == 2
+        assert history["assigned_workers"] == 1
+        assert history["assigned_instances"] == 2
+        assert history["status_counts"]["succeeded"] == 1
+        assert history["status_counts"]["failed"] == 1
+        assert [task["input_key"] for task in history["tasks"]] == ["row-1", "row-2"]
+        assert {task["instance_id"] for task in history["tasks"]} == {"instance-001", "instance-002"}
+        assert history["tasks"][0]["result"] == {"ok": "row-1"}
+        assert history["tasks"][1]["error"] == "boom"
+
+        failed_only = core.get_session_task_history(job["session_id"], status="failed")
+        assert failed_only is not None
+        assert failed_only["task_count"] == 1
+        assert failed_only["tasks"][0]["input_key"] == "row-2"
+
+
+def test_session_task_history_api_and_ui_are_clickable_from_finished_session():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/session-history-ui.db"
+        from fastapi.testclient import TestClient
+        from taskgrid import app as taskgrid_app, core
+
+        core.heartbeat_worker("node-history-ui", metadata={"task_types": ["echo"], "instance_count": 1})
+        job = core.create_job("history ui", "echo", [{"n": 1}], input_keys=["row-ui"])
+        leased = core.lease_tasks("node-history-ui", limit=1, instance_id="instance-001")
+        core.complete_task(leased[0]["id"], "node-history-ui", {"ok": True}, instance_id="instance-001")
+
+        client = TestClient(taskgrid_app.app)
+        raw = client.get(f"/sessions/{job['session_id']}/tasks/history")
+        assert raw.status_code == 200
+        assert raw.json()["tasks"][0]["input_key"] == "row-ui"
+        assert raw.json()["tasks"][0]["instance_id"] == "instance-001"
+
+        session_page = client.get(f"/ui/sessions/{job['session_id']}")
+        assert session_page.status_code == 200
+        assert "Task History" in session_page.text
+        history_page = client.get(f"/ui/sessions/{job['session_id']}/history")
+        assert history_page.status_code == 200
+        assert "Each Task History" in history_page.text
+        assert "row-ui" in history_page.text
+        assert "node-history-ui" in history_page.text
+
+
+def test_queue_diagnostics_explains_paused_missing_capacity_and_leaseable_backlog():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/queue-diagnostics.db"
+        from taskgrid import core
+
+        core.heartbeat_worker("node-echo", metadata={"task_types": ["echo"], "tags": ["cpu"], "instance_count": 1})
+        leaseable = core.create_job("leaseable", "echo", [{"n": 1}], metadata={"required_tags": ["cpu"]})
+        paused = core.create_job("paused", "echo", [{"n": 2}], session_name="paused session")
+        core.set_session_paused(paused["session_id"], True, reason="operator hold", updated_by="test")
+        missing_type = core.create_job("missing type", "gpu_task", [{"n": 3}])
+        missing_tags = core.create_job("missing tags", "echo", [{"n": 4}], metadata={"required_tags": ["gpu"]})
+
+        diagnostics = core.get_queue_diagnostics()
+        reasons = {item["task_id"]: item["reason"] for item in diagnostics["tasks"]}
+        leaseable_task = core.list_tasks(leaseable["id"])[0]["id"]
+        paused_task = core.list_tasks(paused["id"])[0]["id"]
+        missing_type_task = core.list_tasks(missing_type["id"])[0]["id"]
+        missing_tags_task = core.list_tasks(missing_tags["id"])[0]["id"]
+
+        assert reasons[leaseable_task] == "leaseable_now"
+        assert reasons[paused_task] == "session_paused"
+        assert reasons[missing_type_task] == "no_worker_supports_task_type"
+        assert reasons[missing_tags_task] == "missing_required_tags"
+        assert diagnostics["reason_counts"]["leaseable_now"] == 1
+        assert diagnostics["reason_counts"]["session_paused"] == 1
+        assert diagnostics["reason_counts"]["missing_required_tags"] == 1
+        assert any(group["task_type"] == "echo" for group in diagnostics["task_types"])
+        assert diagnostics["workers"][0]["estimated_free_slots"] == 1
+
+
+def test_queue_diagnostics_reports_all_capable_workers_busy():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/queue-busy.db"
+        from taskgrid import core
+
+        core.heartbeat_worker("node-busy", metadata={"task_types": ["echo"], "instance_count": 1})
+        running_job = core.create_job("running", "echo", [{"n": 1}])
+        queued_job = core.create_job("queued", "echo", [{"n": 2}])
+        leased = core.lease_tasks("node-busy", limit=1, instance_id="instance-001")
+        assert leased[0]["job_id"] == running_job["id"]
+
+        diagnostics = core.get_queue_diagnostics()
+        queued_task_id = core.list_tasks(queued_job["id"])[0]["id"]
+        item = next(task for task in diagnostics["tasks"] if task["task_id"] == queued_task_id)
+        assert item["reason"] == "all_capable_workers_busy"
+        assert diagnostics["reason_counts"]["all_capable_workers_busy"] == 1
+        assert diagnostics["workers"][0]["running_slots"] == 1
+        assert diagnostics["workers"][0]["estimated_free_slots"] == 0
+
+
+def test_bulk_task_action_retries_and_cancels_session_tasks():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/bulk-actions.db"
+        from taskgrid import core
+
+        job = core.create_job("bulk controls", "echo", [{"n": 1}, {"n": 2}, {"n": 3}], max_retries=0)
+        leased = core.lease_tasks("node-bulk", limit=1, instance_id="instance-001")
+        failed = core.fail_task(leased[0]["id"], "node-bulk", "boom", instance_id="instance-001")
+        assert failed["status"] == "failed"
+
+        retried = core.bulk_update_tasks(action="retry", session_id=job["session_id"], statuses=["failed"])
+        assert retried["changed"] == 1
+        assert retried["tasks"][0]["status"] == "queued"
+        assert core.get_task(leased[0]["id"])["status"] == "queued"
+
+        cancelled = core.bulk_update_tasks(action="cancel", session_id=job["session_id"], statuses=["queued"])
+        assert cancelled["changed"] == 3
+        assert all(task["status"] == "cancelled" for task in core.list_tasks(job["id"]))
+        assert core.get_session(job["session_id"])["status"] == "cancelled"
+
+
+def test_bulk_task_action_can_force_cancel_running_and_api_ui_expose_controls():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/bulk-actions-api.db"
+        from fastapi.testclient import TestClient
+        from taskgrid import app as taskgrid_app, core
+
+        job = core.create_job("bulk running", "echo", [{"n": 1}, {"n": 2}], max_retries=0)
+        leased = core.lease_tasks("node-force", limit=1, instance_id="instance-001")
+        assert leased[0]["status"] == "running"
+
+        client = TestClient(taskgrid_app.app)
+        page = client.get(f"/ui/sessions/{job['session_id']}/history")
+        assert page.status_code == 200
+        assert "Task Controls" in page.text
+        assert "Force Cancel Running" in page.text
+
+        response = client.post(
+            f"/sessions/{job['session_id']}/tasks/bulk-action",
+            json={"action": "cancel", "statuses": ["running"], "include_running": True},
+        )
+        assert response.status_code == 200
+        assert response.json()["changed"] == 1
+        task = core.get_task(leased[0]["id"])
+        assert task["status"] == "cancelled"
+        assert task["assigned_worker_id"] == "node-force-instance-001"
+
+        # Late worker completion after force-cancel should not overwrite the cancelled state.
+        ignored = core.complete_task(leased[0]["id"], "node-force", {"late": True}, instance_id="instance-001")
+        assert ignored["status"] == "cancelled"
+
+
+def test_operator_snapshot_cache_reuses_and_refreshes_executor_rollup():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/operator-cache.db"
+        from taskgrid import core
+
+        core.clear_operator_cache()
+        core.heartbeat_worker("cache-node", metadata={"task_types": ["echo"], "instance_count": 2})
+        first = core.list_executors()
+        second = core.list_executors()
+        refreshed = core.list_executors(refresh=True)
+
+        assert first["cached"] is False
+        assert second["cached"] is True
+        assert second["cache_ttl_ms"] >= 0
+        assert refreshed["cached"] is False
+        assert refreshed["worker_count"] == 1
+        assert refreshed["instance_count"] == 2
+
+
+def test_batch_lease_response_preserves_task_fields_without_extra_read():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/lease-response.db"
+        from taskgrid import core
+
+        core.heartbeat_worker("lease-node", metadata={"task_types": ["echo"], "instance_count": 2})
+        job = core.create_job("lease response", "echo", [{"n": 1}, {"n": 2}], input_keys=["a", "b"])
+        leased = core.lease_tasks_for_instances("lease-node", ["instance-001", "instance-002"])
+
+        assert len(leased) == 2
+        assert [task["status"] for task in leased] == ["running", "running"]
+        assert [task["attempts"] for task in leased] == [1, 1]
+        assert [task["input_key"] for task in leased] == ["a", "b"]
+        assert [task["payload"]["n"] for task in leased] == [1, 2]
+        assert all(task["assigned_worker_id"].startswith("lease-node-instance-") for task in leased)
+        assert [task["job_id"] for task in leased] == [job["id"], job["id"]]

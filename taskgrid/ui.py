@@ -117,6 +117,8 @@ def layout(title: str, body: str, *, refresh: bool = False) -> str:
         .status-paused {{ background:#fef0c7; color:#b54708; }}
         .status-cancelled, .status-stopped {{ background:#eaecf0; color:#344054; }}
         .status-stale {{ background:#fee4e2; color:#b42318; }}
+        .status-drained, .status-draining {{ background:#fef0c7; color:#b54708; }}
+        .status-disabled {{ background:#eaecf0; color:#344054; }}
         .status-idle {{ background:#ecfdf3; color:#067647; }}
         .progress-wrap {{ height:8px; background:#eaecf0; border-radius:999px; overflow:hidden; min-width:120px; }}
         .progress-fill {{ height:100%; background:#475467; border-radius:999px; }}
@@ -163,6 +165,9 @@ def layout(title: str, body: str, *, refresh: bool = False) -> str:
             <a href='/ui/jobs'>Jobs</a>
             <a href='/ui/submit'>Submit Job</a>
             <a href='/ui/workers'>Workers</a>
+            <a href='/ui/executors'>Executors</a>
+            <a href='/ui/queue'>Queue</a>
+            <a href='/ui/services'>Services</a>
             <a href='/ui/task-catalog'>Task Catalog</a>
             <a href='/ui/manager/data-flow'>Data Flow</a>
             <a href='/ui/manager/recovery'>Recovery</a>
@@ -224,7 +229,7 @@ def session_table(sessions: list[dict[str, Any]]) -> str:
               <td>{h(sess.get('total_tasks', 0))}</td>
               <td class='nowrap'>{h(sess.get('created_at'))}</td>
               <td class='nowrap'>{h(sess.get('started_at') or '—')}<div class='tiny'>end {h(sess.get('finished_at') or '—')}</div></td>
-              <td><a class='button secondary' href='/ui/sessions/{path_id(sess['id'])}'>Open</a></td>
+              <td><a class='button secondary' href='/ui/sessions/{path_id(sess['id'])}'>Open</a> <a class='button secondary' href='/ui/sessions/{path_id(sess['id'])}/history'>History</a></td>
             </tr>
             """
             for sess in sessions
@@ -324,6 +329,264 @@ def result_table(items: list[dict[str, Any]], *, include_job: bool = False) -> s
     </table>
     """
 
+
+
+def session_task_history_table(history: dict[str, Any]) -> str:
+    tasks = history.get("tasks") or []
+    if not tasks:
+        rows = empty_row(13, "No tasks match this session history filter.")
+    else:
+        row_parts = []
+        for item in tasks:
+            worker_id = item.get("worker_id")
+            instance_id = item.get("instance_id")
+            slot = "—"
+            if worker_id and instance_id:
+                slot = f"<a href='/ui/executors/{path_id(worker_id)}/instances/{path_id(instance_id)}'><code>{h(worker_id)} / {h(instance_id)}</code></a>"
+            elif item.get("assigned_worker_id"):
+                slot = f"<code>{h(item.get('assigned_worker_id'))}</code>"
+            value = ""
+            if item.get("error"):
+                value = h(str(item.get("error") or "")[:500])
+            elif item.get("result") is not None:
+                value = pretty_json(item.get("result"))
+            row_parts.append(
+                f"""
+                <tr>
+                  <td><a href='/ui/jobs/{path_id(item.get('job_id'))}'><code>{short_id(item.get('job_id'))}</code></a><div class='tiny'>{h(item.get('job_name') or '')}</div></td>
+                  <td>{h(item.get('input_index') if item.get('input_index') is not None else '—')}</td>
+                  <td><code>{h(item.get('input_key') or '—')}</code></td>
+                  <td><a href='/ui/tasks/{path_id(item.get('task_id'))}'><code>{short_id(item.get('task_id'))}</code></a></td>
+                  <td>{status_pill(item.get('status'))}</td>
+                  <td>{h(item.get('task_type') or '')}</td>
+                  <td>{slot}</td>
+                  <td>{h(item.get('attempts'))}/{1 + int(item.get('max_retries') or 0)}</td>
+                  <td>{seconds_label(item.get('runtime_seconds'))}</td>
+                  <td class='nowrap'>{h(item.get('started_at') or '—')}<div class='tiny'>end {h(item.get('finished_at') or '—')}</div></td>
+                  <td>{h(item.get('payload_bytes') or 0)} B</td>
+                  <td>{h(item.get('result_bytes') or 0)} B</td>
+                  <td><pre>{value}</pre></td>
+                </tr>
+                """
+            )
+        rows = "".join(row_parts)
+    return f"""
+    <table>
+      <thead><tr><th>Job</th><th>Index</th><th>Key</th><th>Task</th><th>Status</th><th>Type</th><th>Final Slot</th><th>Attempts</th><th>Runtime</th><th>Start / End</th><th>Payload</th><th>Result</th><th>Value / Error</th></tr></thead>
+      <tbody>{rows}</tbody>
+    </table>
+    """
+
+
+
+def seconds_label(value: Any) -> str:
+    if value is None:
+        return "—"
+    try:
+        seconds = int(float(value))
+    except (TypeError, ValueError):
+        return "—"
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, sec = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {sec}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes}m"
+
+
+def session_current_assignment_table(assignments: dict[str, Any]) -> str:
+    running = assignments.get("current_assignments") or []
+    if not running:
+        rows = empty_row(9, "No running tasks currently assigned for this session.")
+    else:
+        rows = "".join(
+            f"""
+            <tr>
+              <td><a href='/ui/workers/{path_id(item.get('worker_id'))}'><code>{h(item.get('worker_id') or '—')}</code></a><div class='tiny'><a href='/ui/executors/{path_id(item.get('worker_id'))}/instances/{path_id(item.get('instance_id') or 'node')}'>{h(item.get('instance_id') or 'node')}</a></div></td>
+              <td><a href='/ui/tasks/{path_id(item.get('task_id'))}'><code>{short_id(item.get('task_id'))}</code></a></td>
+              <td><a href='/ui/jobs/{path_id(item.get('job_id'))}'><code>{short_id(item.get('job_id'))}</code></a><div class='tiny'>{h(item.get('job_name') or '')}</div></td>
+              <td>{h(item.get('input_index') if item.get('input_index') is not None else '—')}</td>
+              <td><code>{h(item.get('input_key') or '—')}</code></td>
+              <td>{h(item.get('task_type') or '')}</td>
+              <td>{h(item.get('attempts'))}/{1 + int(item.get('max_retries') or 0)}</td>
+              <td>{seconds_label(item.get('runtime_seconds'))}<div class='tiny'>lease {h(item.get('lease_expires_at') or '—')}</div></td>
+              <td class='nowrap'>{h(item.get('started_at') or '—')}</td>
+            </tr>
+            """
+            for item in running
+        )
+    return f"""
+    <table>
+      <thead><tr><th>Slot</th><th>Task</th><th>Job</th><th>Index</th><th>Key</th><th>Type</th><th>Attempt</th><th>Runtime</th><th>Started</th></tr></thead>
+      <tbody>{rows}</tbody>
+    </table>
+    """
+
+
+def session_worker_assignment_table(assignments: dict[str, Any]) -> str:
+    workers = assignments.get("workers") or []
+    if not workers:
+        rows = empty_row(11, "No worker assignments have been recorded for this session yet.")
+    else:
+        row_parts = []
+        for worker in workers:
+            active_instances = [inst for inst in worker.get("instances", []) if inst.get("session_tasks") or inst.get("state") in {"running", "drained"}]
+            slot_bits = []
+            for inst in active_instances[:12]:
+                current = inst.get("current_task") or {}
+                label = f"{inst.get('instance_id')}:{inst.get('state')}"
+                if current.get("task_id"):
+                    label += f" {str(current.get('task_id'))[:12]}…"
+                slot_bits.append(h(label))
+            if len(active_instances) > 12:
+                slot_bits.append(h(f"+{len(active_instances) - 12} more"))
+            row_parts.append(
+                f"""
+                <tr>
+                  <td><a href='/ui/workers/{path_id(worker.get('worker_id'))}'><code>{h(worker.get('worker_id'))}</code></a><div class='tiny'>{h(worker.get('hostname') or '')}</div></td>
+                  <td>{status_pill(worker.get('state'))}</td>
+                  <td>{h(worker.get('service_name') or '—')}<div class='tiny'>{h(worker.get('service_version') or '—')}</div></td>
+                  <td>{h(worker.get('session_tasks', 0))}</td>
+                  <td>{h(worker.get('running_tasks', 0))}</td>
+                  <td>{h(worker.get('completed_tasks', 0))}</td>
+                  <td>{h(worker.get('failed_tasks', 0))}</td>
+                  <td>{h(worker.get('cancelled_tasks', 0))}</td>
+                  <td>{h(worker.get('active_instances', 0))}/{h(worker.get('desired_instances', 0))}</td>
+                  <td>{', '.join(slot_bits) or '—'}</td>
+                  <td class='nowrap'>{h(worker.get('last_heartbeat_at') or '—')}</td>
+                </tr>
+                """
+            )
+        rows = "".join(row_parts)
+    return f"""
+    <table>
+      <thead><tr><th>Worker</th><th>State</th><th>Service</th><th>Session Tasks</th><th>Running</th><th>Done</th><th>Failed</th><th>Cancelled</th><th>Slots</th><th>Instances</th><th>Heartbeat</th></tr></thead>
+      <tbody>{rows}</tbody>
+    </table>
+    """
+
+
+def session_task_assignment_table(assignments: dict[str, Any]) -> str:
+    tasks = assignments.get("tasks") or []
+    if not tasks:
+        rows = empty_row(12, "No tasks in this session yet.")
+    else:
+        rows = "".join(
+            f"""
+            <tr>
+              <td><a href='/ui/jobs/{path_id(item.get('job_id'))}'><code>{short_id(item.get('job_id'))}</code></a><div class='tiny'>{h(item.get('job_name') or '')}</div></td>
+              <td>{h(item.get('input_index') if item.get('input_index') is not None else '—')}</td>
+              <td><code>{h(item.get('input_key') or '—')}</code></td>
+              <td><a href='/ui/tasks/{path_id(item.get('task_id'))}'><code>{short_id(item.get('task_id'))}</code></a></td>
+              <td>{status_pill(item.get('status'))}</td>
+              <td>{h(item.get('task_type') or '')}</td>
+              <td><code>{h(item.get('worker_id') or '—')}</code></td>
+              <td><code>{h(item.get('instance_id') or '—')}</code></td>
+              <td>{h(item.get('attempts'))}/{1 + int(item.get('max_retries') or 0)}</td>
+              <td>{seconds_label(item.get('runtime_seconds'))}</td>
+              <td class='nowrap'>{h(item.get('started_at') or '—')}<div class='tiny'>updated {h(item.get('updated_at') or '—')}</div></td>
+              <td>{h((item.get('error') or '')[:120])}</td>
+            </tr>
+            """
+            for item in tasks
+        )
+    return f"""
+    <table>
+      <thead><tr><th>Job</th><th>Index</th><th>Key</th><th>Task</th><th>Status</th><th>Type</th><th>Worker</th><th>Instance</th><th>Attempt</th><th>Runtime</th><th>Start / Updated</th><th>Error</th></tr></thead>
+      <tbody>{rows}</tbody>
+    </table>
+    """
+
+def executor_slot_table(summary: dict[str, Any]) -> str:
+    instances = summary.get("instances") or []
+    if not instances:
+        rows = empty_row(13, "No worker instances have heartbeated yet.")
+    else:
+        rows = "".join(
+            f"""
+            <tr>
+              <td><a href='/ui/workers/{path_id(item.get('worker_id'))}'><code>{h(item.get('worker_id'))}</code></a><div class='tiny'>{h(item.get('hostname') or '')}</div></td>
+              <td><a href='/ui/executors/{path_id(item.get('worker_id'))}/instances/{path_id(item.get('instance_id'))}'><code>{h(item.get('instance_id'))}</code></a><div class='tiny'>{h(item.get('executor_id'))}</div></td>
+              <td>{status_pill(item.get('state'))}<div class='tiny'>worker {h(item.get('worker_state') or '—')}</div></td>
+              <td>{h(item.get('service_name') or '—')}<div class='tiny'>{h(item.get('service_version') or '—')}</div></td>
+              <td>{h(item.get('taskgrid_version') or '—')}</td>
+              <td>{h(item.get('status') or '—')}</td>
+              <td>{h(item.get('tasks_completed', 0))}</td>
+              <td>{h(item.get('last_poll_at') or '—')}</td>
+              <td>{_executor_current_task_cell(item)}</td>
+              <td>{_executor_session_cell(item)}</td>
+              <td>{_executor_job_cell(item)}</td>
+              <td>{h(item.get('drain_reason') or '—')}</td>
+              <td><a class='button secondary' href='/ui/workers/{path_id(item.get('worker_id'))}/logs/{path_id(item.get('log_path') or '')}'>Log</a></td>
+            </tr>
+            """
+            for item in instances
+        )
+    return f"""
+    <table>
+      <thead><tr><th>Worker</th><th>Instance</th><th>State</th><th>Service</th><th>TaskGrid</th><th>Advertised Status</th><th>Done</th><th>Last Poll</th><th>Current Task</th><th>Session</th><th>Job</th><th>Drain Reason</th><th>Log</th></tr></thead>
+      <tbody>{rows}</tbody>
+    </table>
+    """
+
+
+def _executor_current_task_cell(item: dict[str, Any]) -> str:
+    task = item.get("current_task") or {}
+    advertised = item.get("advertised_current_task_id")
+    if task.get("task_id"):
+        return f"<a href='/ui/tasks/{path_id(task.get('task_id'))}'><code>{short_id(task.get('task_id'))}</code></a><div class='tiny'>{h(task.get('task_type') or '')} · runtime {seconds_label(task.get('runtime_seconds'))}</div>"
+    if advertised:
+        return f"<code>{h(advertised)}</code><div class='tiny'>advertised by worker, not running in DB</div>"
+    return "—"
+
+
+def _executor_session_cell(item: dict[str, Any]) -> str:
+    task = item.get("current_task") or {}
+    session_id = task.get("session_id") or item.get("session_id")
+    if not session_id:
+        return "—"
+    return f"<a href='/ui/sessions/{path_id(session_id)}'><code>{short_id(session_id)}</code></a><div class='tiny'>{h(task.get('session_name') or '')}</div>"
+
+
+def _executor_job_cell(item: dict[str, Any]) -> str:
+    task = item.get("current_task") or {}
+    job_id = task.get("job_id") or item.get("job_id")
+    if not job_id:
+        return "—"
+    return f"<a href='/ui/jobs/{path_id(job_id)}'><code>{short_id(job_id)}</code></a><div class='tiny'>{h(task.get('job_name') or '')}</div>"
+
+
+def executor_recent_task_table(tasks: list[dict[str, Any]]) -> str:
+    if not tasks:
+        rows = empty_row(11, "No task history has been assigned to this instance yet.")
+    else:
+        rows = "".join(
+            f"""
+            <tr>
+              <td><a href='/ui/tasks/{path_id(item.get('task_id'))}'><code>{short_id(item.get('task_id'))}</code></a></td>
+              <td>{status_pill(item.get('status'))}</td>
+              <td>{h(item.get('task_type') or '')}</td>
+              <td>{h(item.get('input_index') if item.get('input_index') is not None else '—')}</td>
+              <td><code>{h(item.get('input_key') or '—')}</code></td>
+              <td><a href='/ui/sessions/{path_id(item.get('session_id'))}'><code>{short_id(item.get('session_id'))}</code></a><div class='tiny'>{h(item.get('session_name') or '')}</div></td>
+              <td><a href='/ui/jobs/{path_id(item.get('job_id'))}'><code>{short_id(item.get('job_id'))}</code></a><div class='tiny'>{h(item.get('job_name') or '')}</div></td>
+              <td>{h(item.get('attempts'))}/{1 + int(item.get('max_retries') or 0)}</td>
+              <td>{seconds_label(item.get('runtime_seconds'))}</td>
+              <td class='nowrap'>{h(item.get('started_at') or '—')}<div class='tiny'>updated {h(item.get('updated_at') or '—')}</div></td>
+              <td>{h((item.get('error') or '')[:120])}</td>
+            </tr>
+            """
+            for item in tasks
+        )
+    return f"""
+    <table>
+      <thead><tr><th>Task</th><th>Status</th><th>Type</th><th>Index</th><th>Key</th><th>Session</th><th>Job</th><th>Attempt</th><th>Runtime</th><th>Start / Updated</th><th>Error</th></tr></thead>
+      <tbody>{rows}</tbody>
+    </table>
+    """
+
+
 def manager_log_table(text: str, *, max_rows: int = 500) -> str:
     records: list[dict[str, Any]] = []
     malformed = 0
@@ -370,6 +633,138 @@ def manager_log_table(text: str, *, max_rows: int = 500) -> str:
     {note}
     <table>
       <thead><tr><th>At</th><th>Level</th><th>Code</th><th>Entity</th><th>ID</th><th>Message</th><th>Data</th></tr></thead>
+      <tbody>{rows}</tbody>
+    </table>
+    """
+
+
+def queue_reason_table(diagnostics: dict[str, Any]) -> str:
+    reasons = diagnostics.get("reason_counts") or {}
+    if not reasons:
+        rows = empty_row(3, "No queued tasks right now.")
+    else:
+        rows = "".join(
+            f"<tr><td>{status_pill(reason)}</td><td>{h(count)}</td><td>{h(_queue_reason_copy(reason))}</td></tr>"
+            for reason, count in sorted(reasons.items(), key=lambda item: (-int(item[1]), str(item[0])))
+        )
+    return f"""
+    <table>
+      <thead><tr><th>Reason</th><th>Tasks</th><th>Meaning</th></tr></thead>
+      <tbody>{rows}</tbody>
+    </table>
+    """
+
+
+def _queue_reason_copy(reason: str) -> str:
+    return {
+        "leaseable_now": "Eligible for lease when a capable worker polls.",
+        "job_paused": "The job is paused.",
+        "session_paused": "The service session is paused.",
+        "job_not_leaseable": "The job is cancelling or cancelled.",
+        "no_workers_registered": "No workers have heartbeated.",
+        "no_worker_supports_task_type": "No worker advertises this task type.",
+        "missing_required_tags": "Workers support the task type, but required tags do not match.",
+        "all_capable_workers_disabled": "All matching workers are disabled.",
+        "all_capable_workers_draining": "All matching workers are draining.",
+        "all_capable_workers_stale": "All matching workers are stale/offline.",
+        "no_active_capable_worker": "No active worker currently passes all gates.",
+        "all_capable_workers_busy": "Matching workers exist but all advertised slots look busy/drained.",
+    }.get(str(reason), "Scheduler diagnostic reason.")
+
+
+def queue_group_table(groups: list[dict[str, Any]], kind: str) -> str:
+    if not groups:
+        rows = empty_row(6, "No queued backlog groups.")
+    else:
+        row_parts = []
+        for item in groups[:100]:
+            if kind == "session":
+                label = f"<a href='/ui/sessions/{path_id(item.get('session_id'))}'><code>{short_id(item.get('session_id'))}</code></a><div class='tiny'>{h(item.get('name') or '')}</div>"
+                status = item.get("status") or ""
+            elif kind == "job":
+                label = f"<a href='/ui/jobs/{path_id(item.get('job_id'))}'><code>{short_id(item.get('job_id'))}</code></a><div class='tiny'>{h(item.get('name') or '')}</div>"
+                status = item.get("status") or ""
+            else:
+                label = f"<code>{h(item.get('task_type') or '—')}</code>"
+                status = ""
+            reasons = ", ".join(f"{h(key)}:{h(value)}" for key, value in sorted((item.get('reasons') or {}).items()))
+            row_parts.append(
+                f"""
+                <tr>
+                  <td>{label}</td>
+                  <td>{status_pill(status) if status else '—'}</td>
+                  <td>{h(item.get('queued_tasks', 0))}</td>
+                  <td>{h(item.get('leaseable_now', 0))}</td>
+                  <td>{h(item.get('blocked_tasks', 0))}</td>
+                  <td>{reasons or '—'}</td>
+                </tr>
+                """
+            )
+        rows = "".join(row_parts)
+    return f"""
+    <table>
+      <thead><tr><th>{h(kind.title())}</th><th>Status</th><th>Queued</th><th>Leaseable</th><th>Blocked</th><th>Reasons</th></tr></thead>
+      <tbody>{rows}</tbody>
+    </table>
+    """
+
+
+def queue_task_table(diagnostics: dict[str, Any]) -> str:
+    tasks = diagnostics.get("tasks") or []
+    if not tasks:
+        rows = empty_row(10, "No queued tasks right now.")
+    else:
+        row_parts = []
+        for item in tasks[:500]:
+            row_parts.append(
+                f"""
+                <tr>
+                  <td><a href='/ui/tasks/{path_id(item.get('task_id'))}'><code>{short_id(item.get('task_id'))}</code></a></td>
+                  <td><a href='/ui/sessions/{path_id(item.get('session_id'))}'><code>{short_id(item.get('session_id') or '—')}</code></a><div class='tiny'>{h(item.get('session_name') or '')}</div></td>
+                  <td><a href='/ui/jobs/{path_id(item.get('job_id'))}'><code>{short_id(item.get('job_id'))}</code></a><div class='tiny'>{h(item.get('job_name') or '')}</div></td>
+                  <td><code>{h(item.get('task_type') or '')}</code></td>
+                  <td>{h(item.get('input_index') if item.get('input_index') is not None else '—')}</td>
+                  <td><code>{h(item.get('input_key') or '—')}</code></td>
+                  <td>{status_pill(item.get('reason'))}</td>
+                  <td>{''.join(f"<span class='pill'>{h(tag)}</span> " for tag in item.get('required_tags', [])) or '—'}</td>
+                  <td>{h(item.get('attempts'))}/{1 + int(item.get('max_retries') or 0)}</td>
+                  <td>{h(item.get('detail') or '')}</td>
+                </tr>
+                """
+            )
+        rows = "".join(row_parts)
+    return f"""
+    <table>
+      <thead><tr><th>Task</th><th>Session</th><th>Job</th><th>Type</th><th>Index</th><th>Key</th><th>Reason</th><th>Required Tags</th><th>Attempt</th><th>Detail</th></tr></thead>
+      <tbody>{rows}</tbody>
+    </table>
+    """
+
+
+def queue_worker_table(diagnostics: dict[str, Any]) -> str:
+    workers = diagnostics.get("workers") or []
+    if not workers:
+        rows = empty_row(9, "No workers have heartbeated yet.")
+    else:
+        rows = "".join(
+            f"""
+            <tr>
+              <td><a href='/ui/workers/{path_id(worker.get('worker_id'))}'><code>{h(worker.get('worker_id'))}</code></a><div class='tiny'>{h(worker.get('hostname') or '')}</div></td>
+              <td>{status_pill('active' if worker.get('active') else ('disabled' if worker.get('disabled') else ('draining' if worker.get('draining') else 'stale')))}</td>
+              <td>{h(worker.get('service_name') or '—')}<div class='tiny'>{h(worker.get('service_version') or '—')}</div></td>
+              <td>{', '.join(f'<code>{h(t)}</code>' for t in worker.get('task_types', [])) or '<span class="tiny">open/legacy</span>'}</td>
+              <td>{''.join(f"<span class='pill'>{h(tag)}</span> " for tag in worker.get('tags', [])) or '—'}</td>
+              <td>{h(worker.get('running_slots', 0))}/{h(worker.get('active_slots', 0))}</td>
+              <td>{h(worker.get('drained_slots', 0))}</td>
+              <td>{h(worker.get('estimated_free_slots', 0))}</td>
+              <td class='nowrap'>{h(worker.get('last_heartbeat_at') or '—')}</td>
+            </tr>
+            """
+            for worker in workers
+        )
+    return f"""
+    <table>
+      <thead><tr><th>Worker</th><th>State</th><th>Service</th><th>Task Types</th><th>Tags</th><th>Busy/Slots</th><th>Drained</th><th>Est. Free</th><th>Heartbeat</th></tr></thead>
       <tbody>{rows}</tbody>
     </table>
     """
@@ -438,11 +833,13 @@ def session_detail(session_id: str) -> str:
     if not session:
         return layout("Session not found", f"<section class='card'><h1>Session not found</h1><p class='muted'><code>{h(session_id)}</code></p></section>")
     jobs = core.list_session_jobs(session_id, limit=500)
+    assignments = core.get_session_assignments(session_id, limit=1000) or {}
+    status_counts = assignments.get("status_counts", {})
     events = core.list_events(entity_type="service_session", entity_id=session_id, limit=80)
     body = f"""
     <div class='topline'>
       <div><h1>{h(session['name'])}</h1><div class='muted'><code>{h(session['id'])}</code> · created {h(session.get('created_at'))}</div></div>
-      <div class='actions'><a class='button secondary' href='/ui/sessions'>Back to Sessions</a><a class='button secondary' href='/ui/sessions/{path_id(session_id)}/results'>Results</a><a class='button secondary' href='/sessions/{path_id(session_id)}/results/export?format=json'>Download JSON</a><a class='button secondary' href='/sessions/{path_id(session_id)}/results/export?format=csv'>Download CSV</a><a class='button secondary' href='/sessions/{path_id(session_id)}/results'>Raw JSON</a>{'<form method="post" action="/ui/sessions/' + path_id(session_id) + '/resume"><button type="submit">Resume</button></form>' if int(session.get('paused') or 0) else '<form method="post" action="/ui/sessions/' + path_id(session_id) + '/pause"><button class="secondary" type="submit">Pause</button></form>'}</div>
+      <div class='actions'><a class='button secondary' href='/ui/sessions'>Back to Sessions</a><a class='button secondary' href='/ui/sessions/{path_id(session_id)}/history'>Task History</a><a class='button secondary' href='/ui/sessions/{path_id(session_id)}/results'>Results</a><a class='button secondary' href='/sessions/{path_id(session_id)}/results/export?format=json'>Download JSON</a><a class='button secondary' href='/sessions/{path_id(session_id)}/results/export?format=csv'>Download CSV</a><a class='button secondary' href='/sessions/{path_id(session_id)}/results'>Raw JSON</a><a class='button secondary' href='/sessions/{path_id(session_id)}/assignments'>Assignments JSON</a>{'<form method="post" action="/ui/sessions/' + path_id(session_id) + '/resume"><button type="submit">Resume</button></form>' if int(session.get('paused') or 0) else '<form method="post" action="/ui/sessions/' + path_id(session_id) + '/pause"><button class="secondary" type="submit">Pause</button></form>'}</div>
     </div>
     <div class='grid stats'>
       <div class='card stat'><div class='label'>Status</div><div class='value' style='font-size:20px'>{status_pill(session['status'])}{' ' + status_pill('paused') if int(session.get('paused') or 0) else ''}</div><div class='tiny'>{h(session.get('pause_reason') or '')}</div></div>
@@ -458,6 +855,22 @@ def session_detail(session_id: str) -> str:
       <div class='card stat'><div class='label'>Started</div><div class='value' style='font-size:16px'>{h(session.get('started_at') or '—')}</div></div>
       <div class='card stat'><div class='label'>Finished</div><div class='value' style='font-size:16px'>{h(session.get('finished_at') or '—')}</div></div>
     </div>
+    <section class='card' style='margin-top:16px'>
+      <h2>Live Assignment Stats</h2>
+      <p class='muted'>Session-scoped execution view. Shows running assignments by worker instance plus all queued/running/final task placement for this session.</p>
+      <div class='grid stats'>
+        <div class='card stat'><div class='label'>Running Assignments</div><div class='value'>{h(assignments.get('running_assignments', 0))}</div></div>
+        <div class='card stat'><div class='label'>Assigned Workers</div><div class='value'>{h(assignments.get('assigned_workers', 0))}</div></div>
+        <div class='card stat'><div class='label'>Assigned Instances</div><div class='value'>{h(assignments.get('assigned_instances', 0))}</div></div>
+        <div class='card stat'><div class='label'>Status Mix</div><div class='value' style='font-size:16px'>Q {h(status_counts.get('queued', 0))} · R {h(status_counts.get('running', 0))} · OK {h(status_counts.get('succeeded', 0))} · F {h(status_counts.get('failed', 0))}</div></div>
+      </div>
+      <h2 style='margin-top:18px'>Current Running Assignments</h2>
+      {session_current_assignment_table(assignments)}
+      <h2 style='margin-top:18px'>Worker / Instance Rollup</h2>
+      {session_worker_assignment_table(assignments)}
+      <h2 style='margin-top:18px'>Task Assignment Drilldown</h2>
+      {session_task_assignment_table(assignments)}
+    </section>
     <div class='grid two' style='margin-top:16px'>
       <section class='card'><h2>Created Jobs</h2>{job_table(jobs)}</section>
       <section class='card'>
@@ -502,6 +915,85 @@ async def session_pause_from_ui(session_id: str, request: Request) -> RedirectRe
 def session_resume_from_ui(session_id: str) -> RedirectResponse:
     core.set_session_paused(session_id, False, updated_by="ui")
     return RedirectResponse(url=f"/ui/sessions/{path_id(session_id)}", status_code=303)
+
+
+@router.post("/sessions/{session_id}/tasks/retry-failed")
+def session_retry_failed_tasks_from_ui(session_id: str) -> RedirectResponse:
+    core.bulk_update_tasks(action="retry", session_id=session_id, statuses=["failed", "cancelled"], updated_by="ui")
+    return RedirectResponse(url=f"/ui/sessions/{path_id(session_id)}/history", status_code=303)
+
+
+@router.post("/sessions/{session_id}/tasks/cancel-queued")
+def session_cancel_queued_tasks_from_ui(session_id: str) -> RedirectResponse:
+    core.bulk_update_tasks(action="cancel", session_id=session_id, statuses=["queued"], updated_by="ui")
+    return RedirectResponse(url=f"/ui/sessions/{path_id(session_id)}/history?status=cancelled", status_code=303)
+
+
+@router.post("/sessions/{session_id}/tasks/cancel-running")
+def session_cancel_running_tasks_from_ui(session_id: str) -> RedirectResponse:
+    core.bulk_update_tasks(action="cancel", session_id=session_id, statuses=["running"], include_running=True, updated_by="ui")
+    return RedirectResponse(url=f"/ui/sessions/{path_id(session_id)}/history?status=cancelled", status_code=303)
+
+
+@router.get("/sessions/{session_id}/history", response_class=HTMLResponse)
+def session_task_history_page(session_id: str, status: str | None = None, job_id: str | None = None, order: str = "input", limit: int = 5000) -> str:
+    history = core.get_session_task_history(session_id, status=status, job_id=job_id, order=order, limit=limit)
+    if not history:
+        return layout("Session history not found", f"<section class='card'><h1>Session not found</h1><p class='muted'><code>{h(session_id)}</code></p></section>")
+    status_counts = history.get("status_counts") or {}
+    status_links = " ".join(
+        f"<a class='button {'secondary' if status != value else ''}' href='/ui/sessions/{path_id(session_id)}/history{('?status=' + value) if value else ''}'>{label}</a>"
+        for value, label in [(None, "All"), ("queued", "Queued"), ("running", "Running"), ("succeeded", "Succeeded"), ("failed", "Failed"), ("cancelled", "Cancelled")]
+    )
+    job_options = "".join(
+        f"<option value='{h(job.get('job_id'))}' {'selected' if job_id == job.get('job_id') else ''}>{short_id(job.get('job_id'))} · {h(job.get('name') or '')}</option>"
+        for job in history.get("jobs", [])
+    )
+    body = f"""
+    <div class='topline'>
+      <div><h1>Session Task History</h1><div class='muted'><code>{h(history['session_id'])}</code> · {h(history['name'])} · finished {h(history.get('finished_at') or '—')}</div></div>
+      <div class='actions'><a class='button secondary' href='/ui/sessions/{path_id(session_id)}'>Back to Session</a><a class='button secondary' href='/ui/sessions/{path_id(session_id)}/results'>Results</a><a class='button secondary' href='/sessions/{path_id(session_id)}/tasks/history'>Raw JSON</a><a class='button secondary' href='/sessions/{path_id(session_id)}/results/export?format=csv'>Download CSV</a></div>
+    </div>
+    <div class='grid stats'>
+      <div class='card stat'><div class='label'>Status</div><div class='value' style='font-size:20px'>{status_pill(history['status'])}</div></div>
+      <div class='card stat'><div class='label'>Tasks in View</div><div class='value'>{h(history.get('task_count', 0))}</div><div class='tiny'>session total {h(history.get('total_tasks', 0))}</div></div>
+      <div class='card stat'><div class='label'>Final Workers / Instances</div><div class='value'>{h(history.get('assigned_workers', 0))}/{h(history.get('assigned_instances', 0))}</div></div>
+      <div class='card stat'><div class='label'>Avg Runtime</div><div class='value'>{seconds_label(history.get('average_runtime_seconds'))}</div></div>
+      <div class='card stat'><div class='label'>Status Mix</div><div class='value' style='font-size:16px'>Q {h(status_counts.get('queued', 0))} · R {h(status_counts.get('running', 0))} · OK {h(status_counts.get('succeeded', 0))} · F {h(status_counts.get('failed', 0))} · C {h(status_counts.get('cancelled', 0))}</div></div>
+    </div>
+    <section class='card' style='margin-top:16px'>
+      <h2>Filters</h2>
+      <div class='actions' style='margin-bottom:12px'>{status_links}</div>
+      <form class='actions' method='get' action='/ui/sessions/{path_id(session_id)}/history'>
+        <label>Job <select name='job_id'><option value=''>All jobs</option>{job_options}</select></label>
+        <label>Order <select name='order'>
+          <option value='input' {'selected' if order == 'input' else ''}>Input</option>
+          <option value='completed' {'selected' if order in {'completed','finished','finished_at'} else ''}>Completed</option>
+          <option value='started' {'selected' if order in {'started','started_at'} else ''}>Started</option>
+          <option value='status' {'selected' if order == 'status' else ''}>Status</option>
+        </select></label>
+        <label>Limit <input name='limit' type='number' min='1' max='10000' value='{h(limit)}' style='max-width:120px'></label>
+        {f"<input type='hidden' name='status' value='{h(status)}'>" if status else ""}
+        <button type='submit'>Apply</button>
+      </form>
+    </section>
+
+    <section class='card' style='margin-top:16px'>
+      <h2>Task Controls</h2>
+      <p class='muted'>Bulk actions apply to tasks in this session. Retry only affects failed/cancelled tasks; cancel queued does not touch running work. Force-cancel running marks currently running tasks cancelled and ignores late worker completions.</p>
+      <div class='actions'>
+        <form method='post' action='/ui/sessions/{path_id(session_id)}/tasks/retry-failed' onsubmit="return confirm('Retry failed/cancelled tasks in this session?');"><button type='submit'>Retry Failed / Cancelled</button></form>
+        <form method='post' action='/ui/sessions/{path_id(session_id)}/tasks/cancel-queued' onsubmit="return confirm('Cancel queued tasks in this session? Running tasks are not touched.');"><button class='secondary' type='submit'>Cancel Queued</button></form>
+        <form method='post' action='/ui/sessions/{path_id(session_id)}/tasks/cancel-running' onsubmit="return confirm('Force-cancel currently running tasks in this session? Late worker results will be ignored.');"><button class='danger' type='submit'>Force Cancel Running</button></form>
+      </div>
+    </section>
+    <section class='card' style='margin-top:16px'>
+      <h2>Each Task History</h2>
+      <p class='muted'>Durable session history. This is not limited to current assignments: finished sessions keep every task row, final worker/instance slot, attempts, timing, result/error, and links back to task/job detail.</p>
+      {session_task_history_table(history)}
+    </section>
+    """
+    return layout(f"Session task history {session_id}", body, refresh=history["status"] in {"queued", "running"})
 
 
 @router.get("/sessions/{session_id}/results", response_class=HTMLResponse)
@@ -718,6 +1210,116 @@ def retry_task_from_ui(task_id: str) -> RedirectResponse:
     return RedirectResponse(url=target, status_code=303)
 
 
+@router.get("/executors", response_class=HTMLResponse)
+def executors_page() -> str:
+    summary = core.list_executors(limit=2000)
+    body = f"""
+    <div class='topline'>
+      <div><h1>Executors</h1><div class='muted'>Manager-wide live worker instance dashboard. Shows every known execution slot, not just tasks from one session.</div></div>
+      <div class='actions'><a class='button secondary' href='/executors'>Raw JSON</a><a class='button secondary' href='/ui/workers'>Workers</a><a class='button secondary' href='/ui/services'>Services</a></div>
+    </div>
+    <div class='grid stats'>
+      <div class='card stat'><div class='label'>Instances</div><div class='value'>{h(summary.get('instance_count', 0))}</div><div class='tiny'>workers {h(summary.get('worker_count', 0))}</div></div>
+      <div class='card stat'><div class='label'>Running</div><div class='value'>{h(summary.get('running_instances', 0))}</div><div class='tiny'>running tasks {h(summary.get('running_tasks', 0))}</div></div>
+      <div class='card stat'><div class='label'>Idle</div><div class='value'>{h(summary.get('idle_instances', 0))}</div><div class='tiny'>available slots</div></div>
+      <div class='card stat'><div class='label'>Drained / Disabled / Stale</div><div class='value'>{h(summary.get('drained_instances', 0))}/{h(summary.get('disabled_instances', 0))}/{h(summary.get('stale_instances', 0))}</div><div class='tiny'>operator states</div></div>
+    </div>
+    <section class='card' style='margin-top:16px'>
+      <h2>Live Instance Slots</h2>
+      <p class='muted'>This page is global across the manager. Use session assignment drilldown for a session-scoped task view; use this page to see each current executor instance and the task/session/job currently occupying it.</p>
+      {executor_slot_table(summary)}
+    </section>
+    """
+    return layout("Executors", body, refresh=True)
+
+
+@router.get("/executors/{worker_id}/instances/{instance_id}", response_class=HTMLResponse)
+def executor_detail_page(worker_id: str, instance_id: str, recent_limit: int = 100) -> str:
+    detail = core.get_executor(worker_id, instance_id, recent_limit=recent_limit)
+    if not detail:
+        return layout("Executor not found", f"<section class='card'><h1>Executor not found</h1><p class='muted'><code>{h(worker_id)}</code> / <code>{h(instance_id)}</code></p></section>")
+    instance = detail.get("instance") or {}
+    worker = detail.get("worker") or {}
+    current = detail.get("current_task") or {}
+    current_html = "<p class='muted'>No task is currently running on this instance.</p>"
+    if current:
+        current_html = f"""
+        <table><thead><tr><th>Task</th><th>Session</th><th>Job</th><th>Type</th><th>Index</th><th>Attempt</th><th>Runtime</th><th>Lease</th></tr></thead>
+          <tbody><tr>
+            <td><a href='/ui/tasks/{path_id(current.get('task_id'))}'><code>{short_id(current.get('task_id'))}</code></a></td>
+            <td><a href='/ui/sessions/{path_id(current.get('session_id'))}'><code>{short_id(current.get('session_id'))}</code></a><div class='tiny'>{h(current.get('session_name') or '')}</div></td>
+            <td><a href='/ui/jobs/{path_id(current.get('job_id'))}'><code>{short_id(current.get('job_id'))}</code></a><div class='tiny'>{h(current.get('job_name') or '')}</div></td>
+            <td>{h(current.get('task_type') or '')}</td>
+            <td>{h(current.get('input_index') if current.get('input_index') is not None else '—')}<div class='tiny'>{h(current.get('input_key') or '—')}</div></td>
+            <td>{h(current.get('attempts'))}/{1 + int(current.get('max_retries') or 0)}</td>
+            <td>{seconds_label(current.get('runtime_seconds'))}</td>
+            <td class='nowrap'>{h(current.get('lease_expires_at') or '—')}</td>
+          </tr></tbody>
+        </table>
+        """
+    log_path = instance.get('log_path') or f"instances/{instance_id}/worker.log"
+    body = f"""
+    <div class='topline'>
+      <div><h1>Executor Instance</h1><div class='muted'><code>{h(worker_id)}</code> / <code>{h(instance_id)}</code></div></div>
+      <div class='actions'><a class='button secondary' href='/ui/executors'>Back to Executors</a><a class='button secondary' href='/ui/workers/{path_id(worker_id)}'>Worker</a><a class='button secondary' href='/ui/workers/{path_id(worker_id)}/logs/{path_id(log_path)}'>Instance Log</a><a class='button secondary' href='/executors/{path_id(worker_id)}/instances/{path_id(instance_id)}'>Raw JSON</a></div>
+    </div>
+    <div class='grid stats'>
+      <div class='card stat'><div class='label'>State</div><div class='value' style='font-size:20px'>{status_pill(instance.get('state'))}</div><div class='tiny'>worker {h(instance.get('worker_state') or worker.get('state') or '—')}</div></div>
+      <div class='card stat'><div class='label'>Service</div><div class='value' style='font-size:16px'>{h(worker.get('service_name') or instance.get('service_name') or '—')}</div><div class='tiny'>{h(worker.get('service_version') or instance.get('service_version') or '—')}</div></div>
+      <div class='card stat'><div class='label'>Completed By Instance</div><div class='value'>{h(instance.get('tasks_completed', 0))}</div><div class='tiny'>advertised heartbeat counter</div></div>
+      <div class='card stat'><div class='label'>Last Poll</div><div class='value' style='font-size:16px'>{h(instance.get('last_poll_at') or '—')}</div><div class='tiny'>heartbeat {h(worker.get('last_heartbeat_at') or '—')}</div></div>
+    </div>
+    <section class='card' style='margin-top:16px'>
+      <h2>Current Assignment</h2>
+      {current_html}
+    </section>
+    <section class='card' style='margin-top:16px'>
+      <h2>Instance Details</h2>
+      <table><tbody>
+        <tr><th>Executor ID</th><td><code>{h(instance.get('executor_id'))}</code></td></tr>
+        <tr><th>Worker Host</th><td>{h(worker.get('hostname') or instance.get('hostname') or '')}</td></tr>
+        <tr><th>Advertised Status</th><td>{h(instance.get('status') or '—')}</td></tr>
+        <tr><th>Draining</th><td>{h(instance.get('instance_draining'))} {h(instance.get('drain_reason') or '')}</td></tr>
+        <tr><th>Last Error</th><td>{h(instance.get('last_error') or '—')}</td></tr>
+        <tr><th>Log Path</th><td><code>{h(log_path)}</code></td></tr>
+      </tbody></table>
+    </section>
+    <section class='card' style='margin-top:16px'>
+      <h2>Recent Tasks On This Instance</h2>
+      {executor_recent_task_table(detail.get('recent_tasks') or [])}
+    </section>
+    """
+    return layout(f"Executor {worker_id}/{instance_id}", body, refresh=True)
+
+
+@router.get("/queue", response_class=HTMLResponse)
+def queue_page(limit: int = 1000) -> str:
+    diagnostics = core.get_queue_diagnostics(limit=limit)
+    body = f"""
+    <div class='topline'>
+      <div><h1>Queue Diagnostics</h1><div class='muted'>Explains queued tasks and why they are or are not leasing right now. Checked {h(diagnostics.get('checked_at'))}.</div></div>
+      <div class='actions'><a class='button secondary' href='/queue/diagnostics'>Raw JSON</a><a class='button secondary' href='/ui/task-catalog'>Task Catalog</a><a class='button secondary' href='/ui/executors'>Executors</a></div>
+    </div>
+    <div class='grid stats'>
+      <div class='card stat'><div class='label'>Queued Tasks</div><div class='value'>{h(diagnostics.get('queued_tasks', 0))}</div></div>
+      <div class='card stat'><div class='label'>Leaseable Now</div><div class='value'>{h(diagnostics.get('leaseable_now', 0))}</div><div class='tiny'>eligible when workers poll</div></div>
+      <div class='card stat'><div class='label'>Blocked</div><div class='value'>{h(diagnostics.get('blocked_tasks', 0))}</div></div>
+      <div class='card stat'><div class='label'>Estimated Free Slots</div><div class='value'>{h(diagnostics.get('estimated_free_slots', 0))}</div><div class='tiny'>active workers {h(diagnostics.get('workers_active', 0))}/{h(diagnostics.get('workers_total', 0))}</div></div>
+    </div>
+    <div class='grid two' style='margin-top:16px'>
+      <section class='card'><h2>Why Queued?</h2>{queue_reason_table(diagnostics)}</section>
+      <section class='card'><h2>By Task Type</h2>{queue_group_table(diagnostics.get('task_types') or [], 'task type')}</section>
+    </div>
+    <div class='grid two' style='margin-top:16px'>
+      <section class='card'><h2>By Session</h2>{queue_group_table(diagnostics.get('sessions') or [], 'session')}</section>
+      <section class='card'><h2>By Job</h2>{queue_group_table(diagnostics.get('jobs') or [], 'job')}</section>
+    </div>
+    <section class='card' style='margin-top:16px'><h2>Queued Task Detail</h2>{queue_task_table(diagnostics)}</section>
+    <section class='card' style='margin-top:16px'><h2>Worker Capacity Snapshot</h2>{queue_worker_table(diagnostics)}</section>
+    """
+    return layout("Queue Diagnostics", body, refresh=True)
+
+
 @router.get("/task-catalog", response_class=HTMLResponse)
 def task_catalog_page(task_type: str | None = None, required_tags: str | None = None) -> str:
     tags = [tag.strip() for tag in (required_tags or "").split(",") if tag.strip()]
@@ -787,6 +1389,56 @@ def task_catalog_page(task_type: str | None = None, required_tags: str | None = 
     return layout("Task Catalog", body, refresh=True)
 
 
+@router.get("/services", response_class=HTMLResponse)
+def services_page(service_name: str | None = None, service_version: str | None = None) -> str:
+    registry = core.get_services(service_name=service_name, service_version=service_version)
+    services = registry.get("services", [])
+    if not services:
+        rows = empty_row(9, "No worker service metadata has been advertised yet.")
+    else:
+        row_parts = []
+        for item in services:
+            task_types = "".join(f"<span class='pill'>{h(task_type)}</span> " for task_type in item.get("task_types", [])) or '<span class="tiny">none</span>'
+            tags = "".join(f"<span class='pill'>{h(tag)}</span> " for tag in item.get("tags", [])) or '<span class="tiny">none</span>'
+            workers = item.get("workers", [])
+            worker_links = " ".join(f"<a href='/ui/workers'><code>{h(worker.get('id'))}</code></a>" for worker in workers[:6])
+            if len(workers) > 6:
+                worker_links += f" <span class='tiny'>+{len(workers) - 6} more</span>"
+            taskgrid_versions = ", ".join(str(v) for v in item.get("taskgrid_versions", [])) or "—"
+            row_parts.append(f"""
+            <tr>
+              <td><strong>{h(item.get('service_name'))}</strong><div class='tiny'>version {h(item.get('service_version'))}</div></td>
+              <td>{h(item.get('workers_active', 0))}/{h(item.get('workers_total', 0))}<div class='tiny'>stale {h(item.get('workers_stale', 0))} · disabled {h(item.get('workers_disabled', 0))} · draining {h(item.get('workers_draining', 0))}</div></td>
+              <td>{h(item.get('running_tasks', 0))}/{h(item.get('active_instances', 0))}<div class='tiny'>desired {h(item.get('desired_instances', 0))}</div></td>
+              <td>{task_types}</td>
+              <td>{tags}</td>
+              <td>{h(taskgrid_versions)}</td>
+              <td>{worker_links or '<span class="tiny">none</span>'}</td>
+              <td><a class='button secondary' href='/services?service_name={path_id(item.get('service_name'))}&service_version={path_id(item.get('service_version'))}'>Raw</a></td>
+            </tr>
+            """)
+        rows = "".join(row_parts)
+
+    body = f"""
+    <div class='topline'>
+      <div><h1>Services</h1><div class='muted'>Runtime service/application versions advertised by worker heartbeats. Useful for spotting mixed Docker image versions and stale workers.</div></div>
+      <div class='actions'><a class='button secondary' href='/ui/workers'>Workers</a><a class='button secondary' href='/ui/task-catalog'>Task Catalog</a><a class='button secondary' href='/services'>Raw API</a></div>
+    </div>
+    <section class='card'>
+      <form class='form-row' method='get' action='/ui/services'>
+        <label>Service name<input name='service_name' placeholder='risk-engine' value='{h(service_name or '')}'></label>
+        <label>Version<input name='service_version' placeholder='1.2.3' value='{h(service_version or '')}'></label>
+        <label>&nbsp;<button type='submit'>Filter</button></label>
+      </form>
+    </section>
+    <section class='card' style='margin-top:16px'>
+      <h2>Advertised Services</h2>
+      <table><thead><tr><th>Service</th><th>Workers Active/Total</th><th>Busy/Instances</th><th>Task Types</th><th>Tags</th><th>TaskGrid Versions</th><th>Workers</th><th></th></tr></thead><tbody>{rows}</tbody></table>
+    </section>
+    """
+    return layout("Services", body, refresh=True)
+
+
 @router.get("/workers", response_class=HTMLResponse)
 def workers_page() -> str:
     workers = core.list_workers(limit=250)
@@ -796,15 +1448,23 @@ def workers_page() -> str:
         row_parts = []
         for w in workers:
             disabled = bool(w.get("disabled"))
-            effective_status = "disabled" if disabled else (w["status"] if w.get("active") else "stale")
+            draining = bool(w.get("draining"))
+            effective_status = "disabled" if disabled else ("draining" if draining else (w["status"] if w.get("active") else "stale"))
             state_action = "enable" if disabled else "disable"
             state_label = "Enable" if disabled else "Disable"
             state_class = "secondary" if disabled else "danger"
-            reason_text = f"<div class='tiny'>reason: {h(w.get('disabled_reason'))}</div>" if disabled and w.get("disabled_reason") else ""
+            drain_action = "undrain" if draining else "drain"
+            drain_label = "Clear Drain" if draining else "Drain"
+            drain_class = "secondary" if draining else "warning"
+            disabled_reason_text = f"<div class='tiny'>disabled reason: {h(w.get('disabled_reason'))}</div>" if disabled and w.get("disabled_reason") else ""
+            drain_reason_text = f"<div class='tiny'>drain reason: {h(w.get('drain_reason'))}</div>" if draining and w.get("drain_reason") else ""
+            drained_instances = w.get('drained_instances') or []
+            instance_drain_text = f"<div class='tiny'>drained instances: {h(', '.join(drained_instances))}</div>" if drained_instances else ""
+            reason_text = disabled_reason_text + drain_reason_text + instance_drain_text
             row_parts.append(f"""
             <tr>
               <td><input form='bulk-worker-state' type='checkbox' name='worker_ids' value='{h(w['id'])}'></td>
-              <td><code>{h(w['id'])}</code></td>
+              <td><a href='/ui/workers/{path_id(w['id'])}'><code>{h(w['id'])}</code></a></td>
               <td>{h(w['hostname'])}</td>
               <td>{status_pill(effective_status)}<div class='tiny'>active {h(w.get('active'))}</div>{reason_text}</td>
               <td>{''.join(f"<span class='pill'>{h(t)}</span> " for t in (w.get('task_types') or (w.get('metadata') or {}).get('task_types') or [])) or '<span class="tiny">none advertised</span>'}</td>
@@ -827,6 +1487,21 @@ def workers_page() -> str:
                   <input name='reason' placeholder='reason' style='width:120px'>
                   <button class='{state_class}' type='submit'>{state_label}</button>
                 </form>
+                <form class='inline-form' method='post' action='/ui/workers/{path_id(w['id'])}/{drain_action}' onsubmit="return confirm('{drain_label} worker {h(w['id'])}?');" style='margin-top:6px'>
+                  <input name='reason' placeholder='reason' style='width:120px'>
+                  <button class='{drain_class}' type='submit'>{drain_label}</button>
+                </form>
+                <details style='margin-top:6px'><summary class='tiny'>instance drain</summary>
+                  <form class='inline-form' method='post' action='/ui/workers/{path_id(w['id'])}/instances/drain' style='margin-top:6px'>
+                    <input name='instance_id' placeholder='instance-001' style='width:120px'>
+                    <input name='reason' placeholder='reason' style='width:120px'>
+                    <button class='warning' type='submit'>Drain Instance</button>
+                  </form>
+                  <form class='inline-form' method='post' action='/ui/workers/{path_id(w['id'])}/instances/undrain' style='margin-top:6px'>
+                    <input name='instance_id' placeholder='instance-001' style='width:120px'>
+                    <button class='secondary' type='submit'>Clear Instance</button>
+                  </form>
+                </details>
               </td>
             </tr>
             """)
@@ -844,18 +1519,69 @@ def workers_page() -> str:
       </div>
     </div>
     <section class='card'>
-      <p class='muted'>Changing desired instances does not kill running tasks. Disabling a worker is graceful: running tasks may finish, but the manager will not lease new tasks to that node. Heartbeating disabled nodes scale their local instance loops down to zero until re-enabled.</p>
+      <p class='muted'>Changing desired instances does not kill running tasks. Drain blocks new leases while running work finishes and instances remain configured; disable also tells heartbeating nodes to scale local instance loops down to zero until re-enabled.</p>
       <p class='muted'>Offline workers persist in the manager registry for visibility. Purging removes stale worker/config rows only; manager events, task history, results, and remote worker logs are kept.</p>
       <form id='bulk-worker-state' class='inline-form' method='post' action='/ui/workers/bulk-state' onsubmit="return confirm('Apply this state change to selected workers?');" style='margin:0 0 12px'>
         <input name='reason' placeholder='optional reason for selected workers' style='min-width:260px'>
         <button class='danger' type='submit' name='action' value='disable'>Disable Selected</button>
         <button class='secondary' type='submit' name='action' value='enable'>Enable Selected</button>
+        <button class='warning' type='submit' name='action' value='drain'>Drain Selected</button>
+        <button class='secondary' type='submit' name='action' value='undrain'>Clear Drain</button>
         <span class='tiny'>Disabled workers: {h(disabled_count)}</span>
       </form>
       <table><thead><tr><th></th><th>ID</th><th>Host</th><th>Status</th><th>Task Types</th><th>Busy</th><th>Instances</th><th>Pending</th><th>Task</th><th>Version</th><th>Logs</th><th>Heartbeat</th><th>Config</th><th>State</th></tr></thead><tbody>{rows}</tbody></table>
     </section>
     """
     return layout("Workers", body, refresh=True)
+
+
+@router.get("/workers/{worker_id}", response_class=HTMLResponse)
+def worker_detail_page(worker_id: str) -> str:
+    worker = core.get_worker(worker_id)
+    if not worker:
+        return layout("Worker not found", f"<section class='card'><h1>Worker not found</h1><p class='muted'><code>{h(worker_id)}</code></p></section>")
+    summary = core.list_executors(limit=2000)
+    worker_summary = next((item for item in summary.get("workers", []) if item.get("worker_id") == worker_id), None)
+    instance_rows = ""
+    if worker_summary:
+        instance_rows = "".join(
+            f"""
+            <tr>
+              <td><a href='/ui/executors/{path_id(worker_id)}/instances/{path_id(inst.get('instance_id'))}'><code>{h(inst.get('instance_id'))}</code></a></td>
+              <td>{status_pill(inst.get('state'))}</td>
+              <td>{_executor_current_task_cell(inst)}</td>
+              <td>{_executor_session_cell(inst)}</td>
+              <td>{_executor_job_cell(inst)}</td>
+              <td>{h(inst.get('tasks_completed', 0))}</td>
+              <td>{h(inst.get('last_poll_at') or '—')}</td>
+              <td><a class='button secondary' href='/ui/workers/{path_id(worker_id)}/logs/{path_id(inst.get('log_path') or '')}'>Log</a></td>
+            </tr>
+            """
+            for inst in worker_summary.get("instances", [])
+        )
+    if not instance_rows:
+        instance_rows = empty_row(8, "No instances have been advertised for this worker yet.")
+    body = f"""
+    <div class='topline'>
+      <div><h1>Worker</h1><div class='muted'><code>{h(worker_id)}</code> · {h(worker.get('hostname') or '')}</div></div>
+      <div class='actions'><a class='button secondary' href='/ui/workers'>Back to Workers</a><a class='button secondary' href='/ui/executors'>Executors</a>{worker_logs_button(worker)}</div>
+    </div>
+    <div class='grid stats'>
+      <div class='card stat'><div class='label'>Status</div><div class='value' style='font-size:20px'>{status_pill('disabled' if worker.get('disabled') else ('draining' if worker.get('draining') else (worker.get('status') if worker.get('active') else 'stale')))}</div></div>
+      <div class='card stat'><div class='label'>Instances</div><div class='value'>{h(worker.get('active_concurrency', 0))}/{h(worker.get('desired_concurrency', 0))}</div><div class='tiny'>running {h(worker.get('running_tasks', 0))}</div></div>
+      <div class='card stat'><div class='label'>Service</div><div class='value' style='font-size:16px'>{h(worker.get('service_name') or '—')}</div><div class='tiny'>{h(worker.get('service_version') or '—')}</div></div>
+      <div class='card stat'><div class='label'>Heartbeat</div><div class='value' style='font-size:16px'>{h(worker.get('last_heartbeat_at') or '—')}</div></div>
+    </div>
+    <section class='card' style='margin-top:16px'>
+      <h2>Instances</h2>
+      <table><thead><tr><th>Instance</th><th>State</th><th>Current Task</th><th>Session</th><th>Job</th><th>Done</th><th>Last Poll</th><th>Log</th></tr></thead><tbody>{instance_rows}</tbody></table>
+    </section>
+    <section class='card' style='margin-top:16px'>
+      <h2>Worker Metadata</h2>
+      <pre>{pretty_json(worker.get('metadata') or {})}</pre>
+    </section>
+    """
+    return layout(f"Worker {worker_id}", body, refresh=True)
 
 
 @router.get("/workers/{worker_id}/logs", response_class=HTMLResponse)
@@ -949,13 +1675,50 @@ async def worker_enable_from_ui(worker_id: str, request: Request) -> RedirectRes
     return RedirectResponse(url="/ui/workers", status_code=303)
 
 
+@router.post("/workers/{worker_id}/drain")
+async def worker_drain_from_ui(worker_id: str, request: Request) -> RedirectResponse:
+    form = await request.form()
+    core.set_worker_draining(worker_id, draining=True, reason=str(form.get("reason") or ""), updated_by="ui")
+    return RedirectResponse(url="/ui/workers", status_code=303)
+
+
+@router.post("/workers/{worker_id}/undrain")
+async def worker_undrain_from_ui(worker_id: str, request: Request) -> RedirectResponse:
+    form = await request.form()
+    core.set_worker_draining(worker_id, draining=False, reason=str(form.get("reason") or ""), updated_by="ui")
+    return RedirectResponse(url="/ui/workers", status_code=303)
+
+
+@router.post("/workers/{worker_id}/instances/drain")
+async def worker_instance_drain_from_ui(worker_id: str, request: Request) -> RedirectResponse:
+    form = await request.form()
+    instance_id = str(form.get("instance_id") or "").strip()
+    if instance_id:
+        core.set_worker_instance_draining(worker_id, instance_id, draining=True, reason=str(form.get("reason") or ""), updated_by="ui")
+    return RedirectResponse(url="/ui/workers", status_code=303)
+
+
+@router.post("/workers/{worker_id}/instances/undrain")
+async def worker_instance_undrain_from_ui(worker_id: str, request: Request) -> RedirectResponse:
+    form = await request.form()
+    instance_id = str(form.get("instance_id") or "").strip()
+    if instance_id:
+        core.set_worker_instance_draining(worker_id, instance_id, draining=False, updated_by="ui")
+    return RedirectResponse(url="/ui/workers", status_code=303)
+
+
 @router.post("/workers/bulk-state")
 async def worker_bulk_state_from_ui(request: Request) -> RedirectResponse:
     form = await request.form()
     worker_ids = [str(value) for value in form.getlist("worker_ids") if str(value).strip()]
     action = str(form.get("action") or "disable").lower()
+    reason = str(form.get("reason") or "")
     if worker_ids:
-        core.set_workers_enabled(worker_ids, enabled=(action == "enable"), reason=str(form.get("reason") or ""), updated_by="ui")
+        if action in {"drain", "undrain"}:
+            for worker_id in worker_ids:
+                core.set_worker_draining(worker_id, draining=(action == "drain"), reason=reason, updated_by="ui")
+        else:
+            core.set_workers_enabled(worker_ids, enabled=(action == "enable"), reason=reason, updated_by="ui")
     return RedirectResponse(url="/ui/workers", status_code=303)
 
 

@@ -138,13 +138,32 @@ def test_live_sdk_manager_flow_covers_recent_client_and_manager_features():
             {
                 "worker_id": "node-a",
                 "hostname": "integration-host",
-                "metadata": {"tags": ["cpu"], "task_types": ["echo"], "active_concurrency": 3},
+                "metadata": {"tags": ["cpu"], "task_types": ["echo"], "active_concurrency": 3, "service_name": "integration-service", "service_version": "2026.06"},
             },
         )
+        services = client.services()
+        integration_service = next(item for item in services["services"] if item["service_name"] == "integration-service")
+        assert integration_service["service_version"] == "2026.06"
+        assert integration_service["task_types"] == ["echo"]
+        assert integration_service["workers_total"] == 1
+        assert client.services(service_name="integration-service")["services_total"] == 1
+
         assert client.set_worker_instances("node-a", 3)["desired_concurrency"] == 3
         assert client.disable_worker("node-a", reason="integration disable")["disabled"] == 1
         assert _json_request("POST", base_url, "/tasks/lease", {"worker_id": "node-a", "limit": 1}) == []
         assert client.enable_worker("node-a", reason="integration enable")["disabled"] == 0
+        assert client.drain_worker("node-a", reason="integration drain")["draining"] == 1
+        assert _json_request("POST", base_url, "/tasks/lease", {"worker_id": "node-a", "limit": 1}) == []
+        assert client.undrain_worker("node-a", reason="integration resume")["draining"] == 0
+        assert client.drain_worker_instance("node-a", "instance-002", reason="slot maintenance")["draining"] == 1
+        one_slot = _json_request(
+            "POST",
+            base_url,
+            "/tasks/lease-batch",
+            {"worker_id": "node-a", "instance_ids": ["instance-002"]},
+        )
+        assert one_slot == []
+        assert client.undrain_worker_instance("node-a", "instance-002")["draining"] == 0
 
         leased = _json_request(
             "POST",
@@ -154,6 +173,12 @@ def test_live_sdk_manager_flow_covers_recent_client_and_manager_features():
         )
         assert [task["input_key"] for task in leased] == ["row-a", "row-b", "row-c"]
         assert [task["input_index"] for task in leased] == [0, 1, 2]
+
+        assignments = reconnecting.session_assignments(job["session_id"])
+        assert assignments["running_assignments"] == 3
+        assert assignments["assigned_workers"] == 1
+        assert {item["instance_id"] for item in assignments["current_assignments"]} == {"instance-001", "instance-002", "instance-003"}
+        assert assignments["workers"][0]["service_name"] == "integration-service"
 
         # Complete out of order; result APIs and exports should stay in input order.
         for task in reversed(leased):
@@ -170,6 +195,10 @@ def test_live_sdk_manager_flow_covers_recent_client_and_manager_features():
         results = reconnecting.results(job["id"], order="input")
         assert [item["input_key"] for item in results["tasks"]] == ["row-a", "row-b", "row-c"]
         assert [item["result"]["seen"] for item in results["tasks"]] == ["row-a", "row-b", "row-c"]
+        history = reconnecting.session_task_history(job["session_id"])
+        assert [item["input_key"] for item in history["tasks"][:3]] == ["row-a", "row-b", "row-c"]
+        assert {item["instance_id"] for item in history["tasks"][:3]} == {"instance-001", "instance-002", "instance-003"}
+        assert reconnecting.session_task_history(job["session_id"], status="succeeded")["status_counts"]["succeeded"] == 3
 
         csv_text = reconnecting.export_results(job["id"], format="csv").decode("utf-8")
         assert "input_index,input_key" in csv_text

@@ -485,3 +485,136 @@ def test_manager_startup_reconcile_repairs_counter_drift():
             assert response.json()["status"] == "succeeded"
             assert response.json()["completed_tasks"] == 1
         assert core.list_events(code="MaintenanceReconcileRun", limit=1)
+
+
+def test_web_ui_services_page_and_api():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/services-ui.db"
+        from fastapi.testclient import TestClient
+        from taskgrid import core
+        from taskgrid.app import app
+
+        core.heartbeat_worker(
+            "svc-node",
+            metadata={
+                "service_name": "pricing-service",
+                "service_version": "2.1.0",
+                "task_types": ["price"],
+                "tags": ["cpu"],
+                "instance_count": 2,
+            },
+        )
+        client = TestClient(app)
+        raw = client.get("/services")
+        assert raw.status_code == 200
+        assert raw.json()["services"][0]["service_name"] == "pricing-service"
+
+        page = client.get("/ui/services")
+        assert page.status_code == 200
+        assert "pricing-service" in page.text
+        assert "2.1.0" in page.text
+        assert "price" in page.text
+
+
+def test_session_detail_shows_assignment_drilldown_and_api():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/ui-session-assignments.db"
+        from taskgrid import core
+        from taskgrid.app import app
+
+        core.heartbeat_worker(
+            "ui-node-session",
+            metadata={"task_types": ["echo"], "instance_count": 2, "service_name": "ui-service", "service_version": "1.0"},
+        )
+        job = core.create_job("ui assignment", "echo", [{"n": 1}, {"n": 2}], input_keys=["first", "second"])
+        leased = core.lease_tasks_for_instances("ui-node-session", ["instance-001", "instance-002"])
+        core.complete_task(leased[0]["id"], "ui-node-session", {"ok": True}, instance_id="instance-001")
+
+        client = TestClient(app)
+        api = client.get(f"/sessions/{job['session_id']}/assignments")
+        assert api.status_code == 200
+        payload = api.json()
+        assert payload["running_assignments"] == 1
+        assert payload["current_assignments"][0]["instance_id"] == "instance-002"
+
+        page = client.get(f"/ui/sessions/{job['session_id']}")
+        assert page.status_code == 200
+        assert "Live Assignment Stats" in page.text
+        assert "Current Running Assignments" in page.text
+        assert "ui-node-session" in page.text
+        assert "instance-002" in page.text
+        assert "Assignments JSON" in page.text
+
+
+def test_executor_api_and_ui_show_global_instance_assignments():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/ui-executors.db"
+        from taskgrid import core
+        from taskgrid.app import app
+
+        core.heartbeat_worker(
+            "ui-node-exec",
+            metadata={
+                "task_types": ["echo"],
+                "instance_count": 2,
+                "service_name": "ui-executor-service",
+                "service_version": "1.0",
+                "instances": [
+                    {"instance_id": "instance-001", "status": "idle"},
+                    {"instance_id": "instance-002", "status": "idle"},
+                ],
+            },
+        )
+        job = core.create_job("ui executor", "echo", [{"n": 1}], input_keys=["first"])
+        leased = core.lease_tasks_for_instances("ui-node-exec", ["instance-002"])
+        assert leased
+
+        client = TestClient(app)
+        api = client.get("/executors")
+        assert api.status_code == 200
+        payload = api.json()
+        assert payload["running_instances"] == 1
+        assert payload["instances"][1]["instance_id"] == "instance-002"
+        assert payload["instances"][1]["current_task"]["session_id"] == job["session_id"]
+
+        detail_api = client.get("/executors/ui-node-exec/instances/instance-002")
+        assert detail_api.status_code == 200
+        assert detail_api.json()["current_task"]["input_key"] == "first"
+
+        page = client.get("/ui/executors")
+        assert page.status_code == 200
+        assert "Live Instance Slots" in page.text
+        assert "ui-node-exec" in page.text
+        assert "instance-002" in page.text
+        assert "ui-executor-service" in page.text
+
+        detail_page = client.get("/ui/executors/ui-node-exec/instances/instance-002")
+        assert detail_page.status_code == 200
+        assert "Executor Instance" in detail_page.text
+        assert "Current Assignment" in detail_page.text
+        assert "Recent Tasks On This Instance" in detail_page.text
+
+
+def test_queue_diagnostics_api_and_ui_explain_backlog():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TASKGRID_DB"] = f"{tmp}/ui-queue.db"
+        from taskgrid import core
+        from taskgrid.app import app
+        from fastapi.testclient import TestClient
+
+        core.heartbeat_worker("ui-queue-node", metadata={"task_types": ["echo"], "tags": ["cpu"], "instance_count": 1})
+        core.create_job("queue ok", "echo", [{"n": 1}], metadata={"required_tags": ["cpu"]})
+        paused = core.create_job("queue paused", "echo", [{"n": 2}], session_name="Queue Pause")
+        core.set_session_paused(paused["session_id"], True, reason="hold", updated_by="test")
+
+        client = TestClient(app)
+        api = client.get("/queue/diagnostics")
+        assert api.status_code == 200
+        assert api.json()["reason_counts"]["leaseable_now"] == 1
+        assert api.json()["reason_counts"]["session_paused"] == 1
+
+        page = client.get("/ui/queue")
+        assert page.status_code == 200
+        assert "Queue Diagnostics" in page.text
+        assert "session_paused" in page.text
+        assert "ui-queue-node" in page.text

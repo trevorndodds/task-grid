@@ -23,7 +23,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="TaskGrid", version="0.24.2", lifespan=lifespan)
+app = FastAPI(title="TaskGrid", version="0.30.0", lifespan=lifespan)
 app.include_router(ui_router, prefix="/ui", tags=["web-ui"])
 
 
@@ -153,6 +153,17 @@ class WorkerBulkStateIn(BaseModel):
     worker_ids: list[str] = Field(..., min_length=1, max_length=500)
     disabled: bool
     reason: str | None = None
+
+
+class TaskBulkActionIn(BaseModel):
+    action: str = Field(..., pattern="^(retry|retry_failed|retry_cancelled|requeue|cancel|cancel_queued|cancel_filtered)$")
+    session_id: str | None = None
+    job_id: str | None = None
+    task_ids: list[str] | None = Field(None, max_length=10000)
+    statuses: list[str] | None = Field(None, max_length=5)
+    reset_attempts: bool = True
+    include_running: bool = False
+    limit: int = Field(5000, ge=1, le=10000)
 
 
 class PauseIn(BaseModel):
@@ -299,6 +310,28 @@ def session_jobs(session_id: str) -> list[dict[str, Any]]:
     return core.list_session_jobs(session_id)
 
 
+@app.get("/sessions/{session_id}/assignments")
+def session_assignments(session_id: str, limit: int = Query(1000, ge=1, le=5000)) -> dict[str, Any]:
+    summary = core.get_session_assignments(session_id, limit=limit)
+    if not summary:
+        raise HTTPException(status_code=404, detail="session not found")
+    return summary
+
+
+@app.get("/sessions/{session_id}/tasks/history")
+def session_task_history(
+    session_id: str,
+    limit: int = Query(5000, ge=1, le=10000),
+    status: str | None = Query(None, pattern="^(queued|running|succeeded|failed|cancelled)$"),
+    job_id: str | None = None,
+    order: str = Query("input", pattern="^(input|completed|finished|finished_at|started|started_at|status)$"),
+) -> dict[str, Any]:
+    history = core.get_session_task_history(session_id, limit=limit, status=status, job_id=job_id, order=order)
+    if not history:
+        raise HTTPException(status_code=404, detail="session not found")
+    return history
+
+
 @app.post("/sessions/{session_id}/priority")
 def update_session_priority(session_id: str, payload: SessionPriorityIn) -> dict[str, Any]:
     out = core.set_session_priority(session_id, payload.priority, updated_by="api")
@@ -326,6 +359,64 @@ def resume_session(session_id: str) -> dict[str, Any]:
 @app.post("/sessions/bulk-pause")
 def bulk_pause_sessions(payload: SessionBulkPauseIn) -> dict[str, Any]:
     return core.set_sessions_paused(payload.session_ids, payload.paused, reason=payload.reason, updated_by="api")
+
+
+@app.post("/tasks/bulk-action")
+def task_bulk_action(payload: TaskBulkActionIn) -> dict[str, Any]:
+    try:
+        return core.bulk_update_tasks(
+            action=payload.action,
+            session_id=payload.session_id,
+            job_id=payload.job_id,
+            task_ids=payload.task_ids,
+            statuses=payload.statuses,
+            reset_attempts=payload.reset_attempts,
+            include_running=payload.include_running,
+            limit=payload.limit,
+            updated_by="api",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/sessions/{session_id}/tasks/bulk-action")
+def session_task_bulk_action(session_id: str, payload: TaskBulkActionIn) -> dict[str, Any]:
+    if not core.get_session(session_id):
+        raise HTTPException(status_code=404, detail="session not found")
+    try:
+        return core.bulk_update_tasks(
+            action=payload.action,
+            session_id=session_id,
+            job_id=payload.job_id,
+            task_ids=payload.task_ids,
+            statuses=payload.statuses,
+            reset_attempts=payload.reset_attempts,
+            include_running=payload.include_running,
+            limit=payload.limit,
+            updated_by="api",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/jobs/{job_id}/tasks/bulk-action")
+def job_task_bulk_action(job_id: str, payload: TaskBulkActionIn) -> dict[str, Any]:
+    if not core.get_job(job_id):
+        raise HTTPException(status_code=404, detail="job not found")
+    try:
+        return core.bulk_update_tasks(
+            action=payload.action,
+            session_id=payload.session_id,
+            job_id=job_id,
+            task_ids=payload.task_ids,
+            statuses=payload.statuses,
+            reset_attempts=payload.reset_attempts,
+            include_running=payload.include_running,
+            limit=payload.limit,
+            updated_by="api",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.get("/sessions/{session_id}/results")
@@ -440,10 +531,20 @@ def session_results_export(session_id: str, format: str = Query("json", pattern=
     return Response(content=body, media_type=media_type, headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
+@app.get("/queue/diagnostics")
+def queue_diagnostics(limit: int = Query(1000, ge=1, le=10000), active_seconds: int | None = Query(None, ge=1, le=86400), refresh: bool = Query(False)) -> dict[str, Any]:
+    return core.get_queue_diagnostics(limit=limit, active_seconds=active_seconds, refresh=refresh)
+
+
 @app.get("/task-catalog")
 def task_catalog(task_type: str | None = None, required_tags: str | None = None) -> dict[str, Any]:
     tags = [tag.strip() for tag in (required_tags or "").split(",") if tag.strip()]
     return core.get_task_catalog(task_type=task_type, required_tags=tags)
+
+
+@app.get("/services")
+def services(service_name: str | None = None, service_version: str | None = None, active_seconds: int | None = Query(None, ge=1, le=86400), refresh: bool = Query(False)) -> dict[str, Any]:
+    return core.get_services(service_name=service_name, service_version=service_version, active_seconds=active_seconds, refresh=refresh)
 
 
 @app.get("/tasks")
@@ -484,6 +585,19 @@ def workers(limit: int = Query(100, ge=1, le=500)) -> list[dict[str, Any]]:
     return core.list_workers(limit=limit)
 
 
+@app.get("/executors")
+def executors(limit: int = Query(1000, ge=1, le=5000), active_seconds: int | None = Query(None, ge=1, le=86400), refresh: bool = Query(False)) -> dict[str, Any]:
+    return core.list_executors(limit=limit, active_seconds=active_seconds, refresh=refresh)
+
+
+@app.get("/executors/{worker_id}/instances/{instance_id}")
+def executor_detail(worker_id: str, instance_id: str, recent_limit: int = Query(100, ge=1, le=1000)) -> dict[str, Any]:
+    out = core.get_executor(worker_id, instance_id, recent_limit=recent_limit)
+    if not out:
+        raise HTTPException(status_code=404, detail="worker or instance not found")
+    return out
+
+
 @app.post("/workers/purge-offline")
 def purge_offline_workers(
     active_seconds: int | None = Query(None, ge=1, le=86400),
@@ -500,6 +614,26 @@ def disable_worker(worker_id: str, payload: WorkerStateIn | None = None) -> dict
 @app.post("/workers/{worker_id}/enable")
 def enable_worker(worker_id: str, payload: WorkerStateIn | None = None) -> dict[str, Any]:
     return core.set_worker_enabled(worker_id, enabled=True, reason=(payload.reason if payload else None), updated_by="api")
+
+
+@app.post("/workers/{worker_id}/drain")
+def drain_worker(worker_id: str, payload: WorkerStateIn | None = None) -> dict[str, Any]:
+    return core.set_worker_draining(worker_id, draining=True, reason=(payload.reason if payload else None), updated_by="api")
+
+
+@app.post("/workers/{worker_id}/undrain")
+def undrain_worker(worker_id: str, payload: WorkerStateIn | None = None) -> dict[str, Any]:
+    return core.set_worker_draining(worker_id, draining=False, reason=(payload.reason if payload else None), updated_by="api")
+
+
+@app.post("/workers/{worker_id}/instances/{instance_id}/drain")
+def drain_worker_instance(worker_id: str, instance_id: str, payload: WorkerStateIn | None = None) -> dict[str, Any]:
+    return core.set_worker_instance_draining(worker_id, instance_id, draining=True, reason=(payload.reason if payload else None), updated_by="api")
+
+
+@app.post("/workers/{worker_id}/instances/{instance_id}/undrain")
+def undrain_worker_instance(worker_id: str, instance_id: str, payload: WorkerStateIn | None = None) -> dict[str, Any]:
+    return core.set_worker_instance_draining(worker_id, instance_id, draining=False, reason=(payload.reason if payload else None), updated_by="api")
 
 
 @app.post("/workers/bulk-state")

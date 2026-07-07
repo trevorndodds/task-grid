@@ -172,3 +172,22 @@ CPU-heavy trusted/untrusted tasks: --execution-mode process --instances roughly 
 Tiny trusted tasks:              --execution-mode thread  --instances 16..100         --batch-lease-size 8..32
 Idle-heavy clusters:             add --long-poll-seconds 1..5
 ```
+
+
+## 0.32.0 scale notes
+
+TaskGrid 0.32.0 adds two conservative manager-pressure reductions:
+
+- short-lived operator snapshot caching for `/queue/diagnostics`, `/executors`, and `/services`;
+- lease response construction without a post-update `SELECT` for every leased task.
+
+The operator cache is intentionally small and transparent. Responses show `cached`, `cache_age_ms`, and `cache_ttl_ms`, and callers can pass `refresh=true` for an immediate read. This is most useful when dashboards poll during tiny-task bursts where SQLite write throughput is already the bottleneck.
+
+Tuning knobs:
+
+```bash
+TASKGRID_OPERATOR_CACHE_TTL_MS=500
+TASKGRID_LEASE_RECOVERY_INTERVAL_MS=500
+```
+
+Set either value to `0` to disable that optimization. Explicit `/maintenance/recover` and `/maintenance/reconcile` still perform immediate recovery.
